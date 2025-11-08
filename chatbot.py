@@ -50,3 +50,5 @@ if api_key:
         st.session_state["messages"].append({"role": "assistant", "content": reply})
 else:
     st.warning("Please enter your Gemini API key to start chatting.")
+    st.success("chatbot is working!")
+
