@@ -1,9 +1,10 @@
 import urllib.request, json, base64, re, urllib.parse, datetime, time
 
 # --- CONFIGURATION ---
+COMPANY_DOMAIN = "lfg" 
 BASE_URL = f"https://gitlab.{COMPANY_DOMAIN}.com/api/v4"
-TOKEN = "glpat-" # Paste your token here
-PROJECT_IDS = [] # Paste your 12 project IDs here
+TOKEN = "glpat-" 
+PROJECT_IDS = [] 
 
 JIRA_ID = "4323"
 UPGRADE_TYPE = "java17-migration"
@@ -29,25 +30,20 @@ def api_call(endpoint, method="GET", data=None):
     try:
         with urllib.request.urlopen(req, data=body) as response:
             return json.loads(response.read().decode("utf-8"))
-    except Exception as e:
-        return {"error": True, "message": str(e)}
+    except Exception:
+        return {"error": True}
 
 def update_parent_block(match):
-    """Surgically updates the parent block without regex group errors."""
     block = match.group(0)
-    # Update <version>
     block = re.sub(r"<version>.*?</version>", f"<version>{TARGET_PARENT_VERSION}</version>", block)
-    # Update relativePath filename if present
     block = re.sub(r"(parent-pom-).*?(\.xml)", rf"\1{TARGET_PARENT_VERSION}\2", block)
     return block
 
 def wait_and_trigger(pid, pipeline_id, target_job_name):
-    """Polls pipeline for success, then triggers the manual job."""
     log(f"   ⏳ Monitoring Pipeline {pipeline_id} for success...")
-    for _ in range(30): # 15-minute timeout
+    for _ in range(30):
         pipe = api_call(f"projects/{pid}/pipelines/{pipeline_id}")
         status = pipe.get("status")
-        
         if status == "success":
             log(f"   ✅ Success! Finding '{target_job_name}'...")
             jobs = api_call(f"projects/{pid}/pipelines/{pipeline_id}/jobs")
@@ -56,10 +52,8 @@ def wait_and_trigger(pid, pipeline_id, target_job_name):
                     api_call(f"projects/{pid}/jobs/{job['id']}/play", method="POST")
                     log(f"   🚀 Triggered {target_job_name} successfully.")
                     return True
-            log(f"   ⚠️ Manual job '{target_job_name}' not found.")
             return False
         elif status in ["failed", "canceled"]:
-            log(f"   ❌ Pipeline {status}. Handover aborted.", "ERROR")
             return False
         time.sleep(30)
     return False
@@ -67,38 +61,32 @@ def wait_and_trigger(pid, pipeline_id, target_job_name):
 def main():
     if not PROJECT_IDS: return log("Please add PROJECT_IDS.", "ERROR")
     
-    print("\n" + "="*45)
-    print("🚀 JAVA 17 FULL ORCHESTRATION TOOL")
-    print("="*45)
-
     dry_run = input("\nEnable Dry Run? (y/n): ").lower() == 'y'
-    print("\nUpdate Select (Enter comma separated, e.g., 1,2,3):")
-    print("1: POM (Java 17/Parent)\n2: CI (.yml cleanup)\n3: EB (.yml config)")
-    choices = input("Choices: ").replace(" ", "").split(',')
-    
-    do_orch = input("\nManage Tags & Orchestrate Handover? (y/n): ").lower() == 'y'
+    choices = input("Select Updates (1:POM, 2:CI, 3:EB): ").replace(" ", "").split(',')
+    do_orch = input("Manage Tags & Orchestrate? (y/n): ").lower() == 'y'
 
     for pid in PROJECT_IDS:
-        log(f"--- Project ID: {pid} ---")
+        # Fetch Project Name
+        project_info = api_call(f"projects/{pid}")
+        p_name = project_info.get('name', f"ID:{pid}")
+        
+        log(f"--- Processing Project: {p_name} ({pid}) ---")
         actions = []
         
-        # Check current state (Feature branch vs Develop)
         br_check = api_call(f"projects/{pid}/repository/branches/{FEATURE_BRANCH}")
         current_ref = FEATURE_BRANCH if "name" in br_check else SOURCE_BRANCH
         
-        # 1. pom.xml Logic
+        # --- File Logic (POM, CI, EB) ---
         if '1' in choices:
             res = api_call(f"projects/{pid}/repository/files/pom.xml?ref={current_ref}")
             if "content" in res:
                 orig = base64.b64decode(res['content']).decode('utf-8')
                 upd = re.sub(r"<java\.version>.*?</java\.version>", "<java.version>17</java.version>", orig)
-                upd = re.sub(r"<maven\.compiler\.source>.*?</maven\.compiler\.source>", "<maven.compiler.source>17</maven.compiler.source>", upd)
-                upd = re.sub(r"<maven\.compiler\.target>.*?</maven\.compiler\.target>", "<maven.compiler.target>17</maven.compiler.target>", upd)
+                upd = re.sub(r"<maven\.compiler\.(source|target)>.*?</maven\.compiler\.(source|target)>", r"<maven.compiler.\1>17</maven.compiler.\1>", upd)
                 if "<parent>" in upd:
                     upd = re.sub(r"<parent>[\s\S]*?</parent>", update_parent_block, upd)
                 if orig != upd: actions.append({"action": "update", "file_path": "pom.xml", "content": upd})
 
-        # 2. .gitlab-ci.yml Logic (Global Removal)
         if '2' in choices:
             res = api_call(f"projects/{pid}/repository/files/.gitlab-ci.yml?ref={current_ref}")
             if "content" in res:
@@ -106,7 +94,6 @@ def main():
                 upd = re.sub(r"^\s*image:.*(\n|$)", "", orig, flags=re.MULTILINE)
                 if orig != upd: actions.append({"action": "update", "file_path": ".gitlab-ci.yml", "content": upd})
 
-        # 3. .elasticbeanstalk/config.yml Logic
         if '3' in choices:
             path = urllib.parse.quote(".elasticbeanstalk/config.yml", safe='')
             res = api_call(f"projects/{pid}/repository/files/{path}?ref={current_ref}")
@@ -119,23 +106,25 @@ def main():
         if actions and not dry_run:
             if "name" not in br_check:
                 api_call(f"projects/{pid}/repository/branches", "POST", {"branch": FEATURE_BRANCH, "ref": SOURCE_BRANCH})
-            api_call(f"projects/{pid}/repository/commits", "POST", {"branch": FEATURE_BRANCH, "commit_message": f"fix: {UPGRADE_TYPE} updates", "actions": actions})
-            log(f"   [SUCCESS] New changes pushed to {FEATURE_BRANCH}")
+            api_call(f"projects/{pid}/repository/commits", "POST", {"branch": FEATURE_BRANCH, "commit_message": f"fix: {UPGRADE_TYPE}", "actions": actions})
+            log(f"   [SUCCESS] Changes pushed to {FEATURE_BRANCH}")
         elif not actions:
-            log(f"   ✨ PROJECT {pid} IS ALREADY COMPLIANT.")
+            log(f"   ✨ {p_name} is code-compliant.")
 
-        # --- EXECUTION: MR Management (Runs regardless of new changes) ---
+        # --- EXECUTION: Smart MR Management ---
         if not dry_run:
             br_status = api_call(f"projects/{pid}/repository/branches/{FEATURE_BRANCH}")
             if "name" in br_status:
-                if input(f"   ❓ Raise/Update MR for {pid}? (y/n): ").lower() == 'y':
-                    mr_res = api_call(f"projects/{pid}/merge_requests", "POST", {"source_branch": FEATURE_BRANCH, "target_branch": SOURCE_BRANCH, "title": MR_TITLE})
-                    if mr_res.get("error_code") == 409:
-                        log(f"   [INFO] MR already exists for {pid}. In sync.")
-                    else:
-                        log(f"   ✅ MR processed successfully.")
+                # Check if MR already exists
+                existing_mrs = api_call(f"projects/{pid}/merge_requests?state=opened&source_branch={FEATURE_BRANCH}")
+                if existing_mrs and len(existing_mrs) > 0:
+                    log(f"   ℹ️ MR already exists for {p_name}: {existing_mrs[0]['web_url']}")
+                else:
+                    if input(f"   ❓ No MR found for {p_name}. Raise one now? (y/n): ").lower() == 'y':
+                        api_call(f"projects/{pid}/merge_requests", "POST", {"source_branch": FEATURE_BRANCH, "target_branch": SOURCE_BRANCH, "title": MR_TITLE})
+                        log(f"   ✅ MR raised for {p_name}.")
 
-        # --- EXECUTION: Orchestrated Tag Handover ---
+        # --- EXECUTION: Orchestration ---
         if do_orch and not dry_run:
             for tag in ["dev", "azure-dev"]:
                 exists = api_call(f"projects/{pid}/repository/tags/{tag}")
@@ -143,16 +132,10 @@ def main():
                     api_call(f"projects/{pid}/repository/tags/{tag}", method="DELETE")
                     t_res = api_call(f"projects/{pid}/repository/tags", "POST", {"tag_name": tag, "ref": FEATURE_BRANCH})
                     pipe_id = t_res.get('commit', {}).get('last_pipeline', {}).get('id')
-                    
-                    if pipe_id:
-                        # 1. Wait for Success and Terminate Old environment
-                        if wait_and_trigger(pid, pipe_id, "eb-terminate"):
-                            # 2. Trigger Deploy of the new version
-                            wait_and_trigger(pid, pipe_id, f"eb-deploy-{tag}")
-                    else:
-                        log(f"   ⚠️ No pipeline triggered for {tag}.")
+                    if pipe_id and wait_and_trigger(pid, pipe_id, "eb-terminate"):
+                        wait_and_trigger(pid, pipe_id, f"eb-deploy-{tag}")
 
-    log("🏁 Full Job finished.")
+    log("🏁 Job finished.")
 
 if __name__ == "__main__":
     main()
