@@ -637,20 +637,11 @@ def generate_dry_run_summary(summary_data):
         json.dump(summary_data, f, indent=2)
     
     log(f"Dry-run summary saved to {summary_file}", "INFO")
-    
-    # Final reminder
-    print("\n" + "[DRY-RUN] " + "="*60)
-    print("[DRY-RUN] THIS WAS A SIMULATION ONLY")
-    print("[DRY-RUN] NO ACTUAL CHANGES WERE MADE TO GITLAB")
-    print("[DRY-RUN] " + "="*60)
-    print("\nTo run for real and make actual changes:")
-    print(f"  python3 {sys.argv[0]} --projects <your-projects>")
-    print("\nOr run again without --dry-run flag\n")
 
 
 def validate_and_log_token_info(token, base_url):
     """
-    Validate the GitLab token and log its metadata including expiry date, scopes, and access level.
+    Validate the GitLab token and log its metadata including expiry date and access level.
     
     Returns:
         dict with 'valid' (bool) and 'info' (dict with token details)
@@ -703,10 +694,6 @@ def validate_and_log_token_info(token, base_url):
                 }
                 access_name = access_level_names.get(access_level, f'Level {access_level}')
                 log(f"Access Level: {access_name} ({access_level})", "INFO")
-                
-                # Warn if insufficient permissions
-                if access_level < 30:  # Less than Developer
-                    log("[WARNING] Token has insufficient access level. Developer or Maintainer level required.", "WARN")
             
             # Parse and display expiry date
             if token_info['expires_at']:
@@ -739,29 +726,11 @@ def validate_and_log_token_info(token, base_url):
             else:
                 log("Expires At: Never (no expiration set)", "INFO")
             
-            # Display scopes/permissions
+            # Display scopes/permissions (without warnings)
             if token_info['scopes']:
                 log(f"Permissions (Scopes): {', '.join(token_info['scopes'])}", "INFO")
-                
-                # Check for required scopes
-                required_scopes = ['api', 'write_repository', 'read_repository']
-                recommended_scopes = ['read_api']
-                
-                missing_required = [s for s in required_scopes if s not in token_info['scopes']]
-                missing_recommended = [s for s in recommended_scopes if s not in token_info['scopes']]
-                
-                if missing_required:
-                    log(f"[WARNING] Missing REQUIRED scopes: {', '.join(missing_required)}", "WARN")
-                    log("   Script may fail without these permissions!", "WARN")
-                
-                if missing_recommended:
-                    log(f"[INFO] Missing recommended scopes: {', '.join(missing_recommended)}", "INFO")
-                    log("   Some features may not work optimally", "INFO")
-                
-                if not missing_required and not missing_recommended:
-                    log("[SUCCESS] All required and recommended scopes present", "INFO")
             else:
-                log("Permissions (Scopes): None detected (may have full access)", "WARN")
+                log("Permissions (Scopes): None detected (may have full access)", "INFO")
             
             log("=" * 70, "INFO")
             
@@ -786,44 +755,6 @@ def validate_and_log_token_info(token, base_url):
     except Exception as e:
         log(f"Error fetching token information: {e}", "WARN")
         return {'valid': True, 'info': None}  # Assume valid, continue
-
-
-def extract_company_domain_from_url(url):
-    """
-    Extract company domain from GitLab URL.
-    
-    Examples:
-    - https://gitlab.company-domain.com/api/v4 -> company-domain.com
-    - https://gitlab.acme.io/api/v4 -> acme.io
-    - https://git.internal.corp/api/v4 -> internal.corp
-    - https://gitlab.lfg/api/v4 -> lfg
-    - https://gitlab.lfg.local/api/v4 -> lfg.local
-    
-    Returns the domain or None if unable to extract.
-    """
-    try:
-        import re
-        # Remove protocol and api path
-        cleaned = re.sub(r'^https?://', '', url)
-        cleaned = re.sub(r'/api/.*$', '', cleaned)
-        cleaned = re.sub(r':\d+$', '', cleaned)  # Remove port if present
-        
-        # Extract domain (remove 'gitlab.' prefix if present)
-        if cleaned.startswith('gitlab.'):
-            domain = cleaned[7:]  # Remove 'gitlab.' prefix
-        elif cleaned.startswith('git.'):
-            domain = cleaned[4:]  # Remove 'git.' prefix
-        else:
-            domain = cleaned
-        
-        # Return domain if it looks valid
-        # Accept even short domains like 'lfg' (minimum 2 chars)
-        if len(domain) >= 2:
-            return domain
-        
-        return None
-    except Exception:
-        return None
 
 
 def retry(tries=3, delay=1, backoff=2, allowed_exceptions=(Exception,)):
@@ -1278,12 +1209,13 @@ def handle_conflict(conflict_info, pid, p_name):
 
 def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=None, force_tags=False, 
                    auto_deploy=False, non_interactive=False, state=None, rollback_data=None, 
-                   dry_run_summary=None, skip_file_changes=False):
+                   dry_run_summary=None, skip_file_changes=False, enable_tag_deploy=True):
     """
     Process a single project with file changes and/or deployment.
     
     Args:
         skip_file_changes: If True, skip file modification step (just deploy mode)
+        enable_tag_deploy: If True, allow tag creation and deployment
     """
     project_start_time = time.time()
     
@@ -1521,340 +1453,341 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
     else:
         log(f"[INFO] Skipping file changes for {p_name} (deploy-only mode)", "INFO")
 
-    # WORKFLOW 2: Tag and deployment orchestration
-    do_orch = prompt_yes_no("Trigger tags/deployment? (y/n)", default=False if not skip_file_changes else True, non_interactive=non_interactive)
-    if do_orch:
-        tags_resp = fetch_all_tags_for_project(pid)
-        if isinstance(tags_resp, dict) and tags_resp.get("error"):
-            log(f"Could not fetch tags for project {p_name}: {tags_resp.get('details')}", "ERROR")
-            return
+    # WORKFLOW 2: Tag and deployment orchestration (only if enabled)
+    if enable_tag_deploy:
+        do_orch = prompt_yes_no("Trigger tags/deployment? (y/n)", default=False if not skip_file_changes else True, non_interactive=non_interactive)
+        if do_orch:
+            tags_resp = fetch_all_tags_for_project(pid)
+            if isinstance(tags_resp, dict) and tags_resp.get("error"):
+                log(f"Could not fetch tags for project {p_name}: {tags_resp.get('details')}", "ERROR")
+                return
 
-        available_tags_all = tags_resp if isinstance(tags_resp, list) else []
-        
-        # Filter and sort deployment tags
-        filter_result = filter_and_sort_deployment_tags(available_tags_all)
-        
-        if isinstance(filter_result, dict) and filter_result.get("error"):
-            log(f"Error filtering tags: {filter_result.get('details')}", "ERROR")
-            return
-        
-        available_tags = filter_result['sorted_tags']
-        found_categories = filter_result['found_categories']
-        missing_categories = filter_result['missing_categories']
-        
-        # Log what was found
-        log(f"Deployment tags found for {p_name}:", "INFO")
-        if found_categories:
-            for category, tag_names in found_categories.items():
-                log(f"  {category.upper()}: {', '.join(tag_names)}", "INFO")
-        
-        # Log missing tags
-        if missing_categories:
-            for category in missing_categories:
-                log(f"  {category.upper()}: NOT FOUND", "WARN")
-        
-        # Check if both dev and test are missing
-        dev_missing = 'dev' in missing_categories
-        test_missing = 'test' in missing_categories
-        
-        if dev_missing and test_missing:
-            log(f"No dev or test tags present for project {p_name}.", "ERROR")
-            if not prompt_yes_no("Do you want to create new deployment tags on the feature branch?", default=False, non_interactive=non_interactive):
+            available_tags_all = tags_resp if isinstance(tags_resp, list) else []
+            
+            # Filter and sort deployment tags
+            filter_result = filter_and_sort_deployment_tags(available_tags_all)
+            
+            if isinstance(filter_result, dict) and filter_result.get("error"):
+                log(f"Error filtering tags: {filter_result.get('details')}", "ERROR")
                 return
             
-            # Ask which tags to create
-            print("\nWhich tags would you like to create?")
-            print("  1. dev (or azure-dev)")
-            print("  2. test (or azure-test)")
-            print("  3. Both dev and test")
-            print("  4. Custom tag name")
+            available_tags = filter_result['sorted_tags']
+            found_categories = filter_result['found_categories']
+            missing_categories = filter_result['missing_categories']
             
-            choice = input("Enter choice [1/2/3/4]: ").strip()
-            tags_to_create = []
+            # Log what was found
+            log(f"Deployment tags found for {p_name}:", "INFO")
+            if found_categories:
+                for category, tag_names in found_categories.items():
+                    log(f"  {category.upper()}: {', '.join(tag_names)}", "INFO")
             
-            # Detect naming convention from existing tags
-            has_azure_prefix = any('azure-' in t.get('name', '').lower() for t in available_tags_all if isinstance(t, dict))
+            # Log missing tags
+            if missing_categories:
+                for category in missing_categories:
+                    log(f"  {category.upper()}: NOT FOUND", "WARN")
             
-            if choice == '1':
-                tags_to_create = ['azure-dev' if has_azure_prefix else 'dev']
-            elif choice == '2':
-                tags_to_create = ['azure-test' if has_azure_prefix else 'test']
-            elif choice == '3':
-                if has_azure_prefix:
-                    tags_to_create = ['azure-dev', 'azure-test']
-                else:
-                    tags_to_create = ['dev', 'test']
-            elif choice == '4':
-                custom_tag = input("Enter custom tag name: ").strip()
-                if custom_tag:
-                    tags_to_create = [custom_tag]
+            # Check if both dev and test are missing
+            dev_missing = 'dev' in missing_categories
+            test_missing = 'test' in missing_categories
             
-            if tags_to_create:
-                for tag_name in tags_to_create:
-                    t_res = api_call(f"projects/{pid}/repository/tags", "POST", 
-                                   {"tag_name": tag_name, "ref": FEATURE_BRANCH}, dry_run=dry_run)
-                    if dry_run:
-                        log(f"(dry-run) Would create tag '{tag_name}' on {FEATURE_BRANCH}", "DRY")
-                    else:
-                        if not isinstance(t_res, dict) or not t_res.get("error"):
-                            created_tags.add(tag_name)
-                            created_tag_commit = (t_res.get('commit') or {}).get('id') if isinstance(t_res, dict) else None
-                            if created_tag_commit:
-                                committed_shas.add(created_tag_commit)
-                            log(f"Created tag '{tag_name}' on {FEATURE_BRANCH}", "INFO")
-                        else:
-                            log(f"Failed to create tag '{tag_name}': {t_res.get('details')}", "ERROR")
-            return
-        
-        # If only dev is missing, suggest creating it
-        if dev_missing and not test_missing:
-            log(f"Dev tag is missing for project {p_name}.", "WARN")
-            test_tag_names = found_categories.get('test', [])
-            if test_tag_names:
-                has_azure_prefix = any('azure-' in name for name in test_tag_names)
-                suggested_tag = 'azure-dev' if has_azure_prefix else 'dev'
+            if dev_missing and test_missing:
+                log(f"No dev or test tags present for project {p_name}.", "ERROR")
+                if not prompt_yes_no("Do you want to create new deployment tags on the feature branch?", default=False, non_interactive=non_interactive):
+                    return
                 
-                if prompt_yes_no(f"Test tag exists but dev tag is missing. Create '{suggested_tag}' tag?", default=False, non_interactive=non_interactive):
-                    t_res = api_call(f"projects/{pid}/repository/tags", "POST", 
-                                   {"tag_name": suggested_tag, "ref": FEATURE_BRANCH}, dry_run=dry_run)
-                    if dry_run:
-                        log(f"(dry-run) Would create tag '{suggested_tag}' on {FEATURE_BRANCH}", "DRY")
-                    else:
-                        if not isinstance(t_res, dict) or not t_res.get("error"):
-                            created_tags.add(suggested_tag)
-                            created_tag_commit = (t_res.get('commit') or {}).get('id') if isinstance(t_res, dict) else None
-                            if created_tag_commit:
-                                committed_shas.add(created_tag_commit)
-                            log(f"Created tag '{suggested_tag}' on {FEATURE_BRANCH}", "INFO")
-                            available_tags.insert(0, {'name': suggested_tag, 'commit': {'id': created_tag_commit}})
-                        else:
-                            log(f"Failed to create tag '{suggested_tag}': {t_res.get('details')}", "ERROR")
-                            return
-        
-        # If only test is missing, suggest creating it
-        if test_missing and not dev_missing:
-            log(f"Test tag is missing for project {p_name}.", "WARN")
-            dev_tag_names = found_categories.get('dev', [])
-            if dev_tag_names:
-                has_azure_prefix = any('azure-' in name for name in dev_tag_names)
-                suggested_tag = 'azure-test' if has_azure_prefix else 'test'
+                # Ask which tags to create
+                print("\nWhich tags would you like to create?")
+                print("  1. dev (or azure-dev)")
+                print("  2. test (or azure-test)")
+                print("  3. Both dev and test")
+                print("  4. Custom tag name")
                 
-                if prompt_yes_no(f"Dev tag exists but test tag is missing. Create '{suggested_tag}' tag?", default=False, non_interactive=non_interactive):
-                    t_res = api_call(f"projects/{pid}/repository/tags", "POST", 
-                                   {"tag_name": suggested_tag, "ref": FEATURE_BRANCH}, dry_run=dry_run)
-                    if dry_run:
-                        log(f"(dry-run) Would create tag '{suggested_tag}' on {FEATURE_BRANCH}", "DRY")
+                choice = input("Enter choice [1/2/3/4]: ").strip()
+                tags_to_create = []
+                
+                # Detect naming convention from existing tags
+                has_azure_prefix = any('azure-' in t.get('name', '').lower() for t in available_tags_all if isinstance(t, dict))
+                
+                if choice == '1':
+                    tags_to_create = ['azure-dev' if has_azure_prefix else 'dev']
+                elif choice == '2':
+                    tags_to_create = ['azure-test' if has_azure_prefix else 'test']
+                elif choice == '3':
+                    if has_azure_prefix:
+                        tags_to_create = ['azure-dev', 'azure-test']
                     else:
-                        if not isinstance(t_res, dict) or not t_res.get("error"):
-                            created_tags.add(suggested_tag)
-                            created_tag_commit = (t_res.get('commit') or {}).get('id') if isinstance(t_res, dict) else None
-                            if created_tag_commit:
-                                committed_shas.add(created_tag_commit)
-                            log(f"Created tag '{suggested_tag}' on {FEATURE_BRANCH}", "INFO")
-                            available_tags.append({'name': suggested_tag, 'commit': {'id': created_tag_commit}})
+                        tags_to_create = ['dev', 'test']
+                elif choice == '4':
+                    custom_tag = input("Enter custom tag name: ").strip()
+                    if custom_tag:
+                        tags_to_create = [custom_tag]
+                
+                if tags_to_create:
+                    for tag_name in tags_to_create:
+                        t_res = api_call(f"projects/{pid}/repository/tags", "POST", 
+                                       {"tag_name": tag_name, "ref": FEATURE_BRANCH}, dry_run=dry_run)
+                        if dry_run:
+                            log(f"(dry-run) Would create tag '{tag_name}' on {FEATURE_BRANCH}", "DRY")
                         else:
-                            log(f"Failed to create tag '{suggested_tag}': {t_res.get('details')}", "ERROR")
-                            return
-        
-        if not available_tags:
-            log(f"No deployment tags (dev/test/performance) found for project {p_name}.", "WARN")
-            if not prompt_yes_no("Do you want to create a new tag on the feature branch anyway?", default=False, non_interactive=non_interactive):
+                            if not isinstance(t_res, dict) or not t_res.get("error"):
+                                created_tags.add(tag_name)
+                                created_tag_commit = (t_res.get('commit') or {}).get('id') if isinstance(t_res, dict) else None
+                                if created_tag_commit:
+                                    committed_shas.add(created_tag_commit)
+                                log(f"Created tag '{tag_name}' on {FEATURE_BRANCH}", "INFO")
+                            else:
+                                log(f"Failed to create tag '{tag_name}': {t_res.get('details')}", "ERROR")
                 return
-            new_tag_name = input("Enter tag name to create on feature branch: ").strip()
-            if new_tag_name:
-                t_res = api_call(f"projects/{pid}/repository/tags", "POST", {"tag_name": new_tag_name, "ref": FEATURE_BRANCH}, dry_run=dry_run)
-                if dry_run:
-                    log(f"(dry-run) Would create tag '{new_tag_name}' on {FEATURE_BRANCH}", "DRY")
-                else:
-                    if not isinstance(t_res, dict) or not t_res.get("error"):
-                        created_tags.add(new_tag_name)
-                        created_tag_commit = (t_res.get('commit') or {}).get('id') if isinstance(t_res, dict) else None
-                        if created_tag_commit:
-                            committed_shas.add(created_tag_commit)
-                        log(f"Created tag '{new_tag_name}' on {FEATURE_BRANCH}", "INFO")
+            
+            # If only dev is missing, suggest creating it
+            if dev_missing and not test_missing:
+                log(f"Dev tag is missing for project {p_name}.", "WARN")
+                test_tag_names = found_categories.get('test', [])
+                if test_tag_names:
+                    has_azure_prefix = any('azure-' in name for name in test_tag_names)
+                    suggested_tag = 'azure-dev' if has_azure_prefix else 'dev'
+                    
+                    if prompt_yes_no(f"Test tag exists but dev tag is missing. Create '{suggested_tag}' tag?", default=False, non_interactive=non_interactive):
+                        t_res = api_call(f"projects/{pid}/repository/tags", "POST", 
+                                       {"tag_name": suggested_tag, "ref": FEATURE_BRANCH}, dry_run=dry_run)
+                        if dry_run:
+                            log(f"(dry-run) Would create tag '{suggested_tag}' on {FEATURE_BRANCH}", "DRY")
+                        else:
+                            if not isinstance(t_res, dict) or not t_res.get("error"):
+                                created_tags.add(suggested_tag)
+                                created_tag_commit = (t_res.get('commit') or {}).get('id') if isinstance(t_res, dict) else None
+                                if created_tag_commit:
+                                    committed_shas.add(created_tag_commit)
+                                log(f"Created tag '{suggested_tag}' on {FEATURE_BRANCH}", "INFO")
+                                available_tags.insert(0, {'name': suggested_tag, 'commit': {'id': created_tag_commit}})
+                            else:
+                                log(f"Failed to create tag '{suggested_tag}': {t_res.get('details')}", "ERROR")
+                                return
+            
+            # If only test is missing, suggest creating it
+            if test_missing and not dev_missing:
+                log(f"Test tag is missing for project {p_name}.", "WARN")
+                dev_tag_names = found_categories.get('dev', [])
+                if dev_tag_names:
+                    has_azure_prefix = any('azure-' in name for name in dev_tag_names)
+                    suggested_tag = 'azure-test' if has_azure_prefix else 'test'
+                    
+                    if prompt_yes_no(f"Dev tag exists but test tag is missing. Create '{suggested_tag}' tag?", default=False, non_interactive=non_interactive):
+                        t_res = api_call(f"projects/{pid}/repository/tags", "POST", 
+                                       {"tag_name": suggested_tag, "ref": FEATURE_BRANCH}, dry_run=dry_run)
+                        if dry_run:
+                            log(f"(dry-run) Would create tag '{suggested_tag}' on {FEATURE_BRANCH}", "DRY")
+                        else:
+                            if not isinstance(t_res, dict) or not t_res.get("error"):
+                                created_tags.add(suggested_tag)
+                                created_tag_commit = (t_res.get('commit') or {}).get('id') if isinstance(t_res, dict) else None
+                                if created_tag_commit:
+                                    committed_shas.add(created_tag_commit)
+                                log(f"Created tag '{suggested_tag}' on {FEATURE_BRANCH}", "INFO")
+                                available_tags.append({'name': suggested_tag, 'commit': {'id': created_tag_commit}})
+                            else:
+                                log(f"Failed to create tag '{suggested_tag}': {t_res.get('details')}", "ERROR")
+                                return
+            
+            if not available_tags:
+                log(f"No deployment tags (dev/test/performance) found for project {p_name}.", "WARN")
+                if not prompt_yes_no("Do you want to create a new tag on the feature branch anyway?", default=False, non_interactive=non_interactive):
+                    return
+                new_tag_name = input("Enter tag name to create on feature branch: ").strip()
+                if new_tag_name:
+                    t_res = api_call(f"projects/{pid}/repository/tags", "POST", {"tag_name": new_tag_name, "ref": FEATURE_BRANCH}, dry_run=dry_run)
+                    if dry_run:
+                        log(f"(dry-run) Would create tag '{new_tag_name}' on {FEATURE_BRANCH}", "DRY")
                     else:
-                        log(f"Failed to create tag '{new_tag_name}': {t_res.get('details')}", "ERROR")
-            return
+                        if not isinstance(t_res, dict) or not t_res.get("error"):
+                            created_tags.add(new_tag_name)
+                            created_tag_commit = (t_res.get('commit') or {}).get('id') if isinstance(t_res, dict) else None
+                            if created_tag_commit:
+                                committed_shas.add(created_tag_commit)
+                            log(f"Created tag '{new_tag_name}' on {FEATURE_BRANCH}", "INFO")
+                        else:
+                            log(f"Failed to create tag '{new_tag_name}': {t_res.get('details')}", "ERROR")
+                return
 
-        print(f"\nAvailable deployment tags for {p_name} (sorted by deployment order):")
-        for i, t in enumerate(available_tags):
-            commit_id = (t.get('commit') or {}).get('id', '') if isinstance(t, dict) else ''
-            protected_marker = " [PROTECTED]" if t.get('protected') else ""
-            print(f"  {i+1:>3}. {t.get('name', '')}{protected_marker}  {commit_id[:8] if commit_id else ''}")
+            print(f"\nAvailable deployment tags for {p_name} (sorted by deployment order):")
+            for i, t in enumerate(available_tags):
+                commit_id = (t.get('commit') or {}).get('id', '') if isinstance(t, dict) else ''
+                protected_marker = " [PROTECTED]" if t.get('protected') else ""
+                print(f"  {i+1:>3}. {t.get('name', '')}{protected_marker}  {commit_id[:8] if commit_id else ''}")
 
-        sel = input("Select tags to delete & recreate by index or name (e.g. '1,3' or 'dev,test') or 'all' or leave empty to skip: ").strip()
-        selected_tag_names = parse_tag_selection_input(sel, available_tags)
-        if not selected_tag_names:
-            log("No tags selected; skipping tag orchestration for this project.", "INFO")
-        else:
-            print(f"Selected tags: {', '.join(selected_tag_names)}")
-            
-            # Check if any selected tags are protected
-            protected_tags = []
-            for tag_name in selected_tag_names:
-                tag_obj = next((t for t in available_tags_all if isinstance(t, dict) and t.get('name') == tag_name), None)
-                if tag_obj and tag_obj.get('protected'):
-                    protected_tags.append(tag_name)
-            
-            if protected_tags:
-                log(f"WARNING: The following tags are PROTECTED and cannot be deleted: {', '.join(protected_tags)}", "ERROR")
-                log("Protected tags will be skipped during tag orchestration.", "WARN")
-                if not prompt_yes_no("Continue with non-protected tags only?", default=False, non_interactive=non_interactive):
-                    log("Tag orchestration cancelled by user.", "INFO")
-                    return
-                selected_tag_names = [t for t in selected_tag_names if t not in protected_tags]
-                if not selected_tag_names:
-                    log("No non-protected tags remaining; skipping tag orchestration.", "INFO")
-                    return
-            
-            if not prompt_yes_no("Proceed with deleting (if present) and recreating these tags on the feature branch?", default=False, non_interactive=non_interactive):
-                log("Tag orchestration cancelled by user.", "INFO")
+            sel = input("Select tags to delete & recreate by index or name (e.g. '1,3' or 'dev,test') or 'all' or leave empty to skip: ").strip()
+            selected_tag_names = parse_tag_selection_input(sel, available_tags)
+            if not selected_tag_names:
+                log("No tags selected; skipping tag orchestration for this project.", "INFO")
             else:
-                branch_info_for_tag = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
-                feature_head = None
-                if isinstance(branch_info_for_tag, dict) and not branch_info_for_tag.get("error"):
-                    feature_head = (branch_info_for_tag.get("commit") or {}).get("id")
+                print(f"Selected tags: {', '.join(selected_tag_names)}")
+                
+                # Check if any selected tags are protected
+                protected_tags = []
+                for tag_name in selected_tag_names:
+                    tag_obj = next((t for t in available_tags_all if isinstance(t, dict) and t.get('name') == tag_name), None)
+                    if tag_obj and tag_obj.get('protected'):
+                        protected_tags.append(tag_name)
+                
+                if protected_tags:
+                    log(f"WARNING: The following tags are PROTECTED and cannot be deleted: {', '.join(protected_tags)}", "ERROR")
+                    log("Protected tags will be skipped during tag orchestration.", "WARN")
+                    if not prompt_yes_no("Continue with non-protected tags only?", default=False, non_interactive=non_interactive):
+                        log("Tag orchestration cancelled by user.", "INFO")
+                        return
+                    selected_tag_names = [t for t in selected_tag_names if t not in protected_tags]
+                    if not selected_tag_names:
+                        log("No non-protected tags remaining; skipping tag orchestration.", "INFO")
+                        return
+                
+                if not prompt_yes_no("Proceed with deleting (if present) and recreating these tags on the feature branch?", default=False, non_interactive=non_interactive):
+                    log("Tag orchestration cancelled by user.", "INFO")
+                else:
+                    branch_info_for_tag = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
+                    feature_head = None
+                    if isinstance(branch_info_for_tag, dict) and not branch_info_for_tag.get("error"):
+                        feature_head = (branch_info_for_tag.get("commit") or {}).get("id")
 
-                for tag in selected_tag_names:
-                    quoted_tag = urllib.parse.quote(tag, safe='')
-                    tag_obj = next((t for t in available_tags_all if isinstance(t, dict) and t.get('name') == tag), None)
-                    tag_commit_id = (tag_obj.get('commit') or {}).get('id') if tag_obj else None
+                    for tag in selected_tag_names:
+                        quoted_tag = urllib.parse.quote(tag, safe='')
+                        tag_obj = next((t for t in available_tags_all if isinstance(t, dict) and t.get('name') == tag), None)
+                        tag_commit_id = (tag_obj.get('commit') or {}).get('id') if tag_obj else None
 
-                    if tag_commit_id and tag_commit_id in committed_shas:
-                        log(f"Skipping tag '{tag}': it already points to a commit created in this run ({tag_commit_id[:8]}).", "INFO")
-                        continue
-                    if tag in created_tags:
-                        log(f"Skipping tag '{tag}': it was created earlier in this run.", "INFO")
-                        continue
-                    
-                    # Only skip if tag points to feature head AND force_tags is False
-                    if not force_tags and tag_commit_id and feature_head and tag_commit_id == feature_head:
-                        log(f"Skipping tag '{tag}': already points to feature branch head {feature_head[:8]}. Use --force-tags to recreate anyway.", "INFO")
-                        continue
-                    
-                    if force_tags and tag_commit_id and feature_head and tag_commit_id == feature_head:
-                        log(f"Force recreating tag '{tag}' (already at feature branch head {feature_head[:8]})", "INFO")
-
-                    exists_locally = tag_obj is not None
-                    if exists_locally:
-                        if tag_obj.get('protected'):
-                            log(f"Skipping PROTECTED tag '{tag}' - cannot delete.", "ERROR")
+                        if tag_commit_id and tag_commit_id in committed_shas:
+                            log(f"Skipping tag '{tag}': it already points to a commit created in this run ({tag_commit_id[:8]}).", "INFO")
                             continue
-                        log(f"Tag '{tag}' exists and will be deleted.", "INFO")
-                        api_call(f"projects/{pid}/repository/tags/{quoted_tag}", method="DELETE", dry_run=dry_run)
+                        if tag in created_tags:
+                            log(f"Skipping tag '{tag}': it was created earlier in this run.", "INFO")
+                            continue
+                        
+                        # Only skip if tag points to feature head AND force_tags is False
+                        if not force_tags and tag_commit_id and feature_head and tag_commit_id == feature_head:
+                            log(f"Skipping tag '{tag}': already points to feature branch head {feature_head[:8]}. Use --force-tags to recreate anyway.", "INFO")
+                            continue
+                        
+                        if force_tags and tag_commit_id and feature_head and tag_commit_id == feature_head:
+                            log(f"Force recreating tag '{tag}' (already at feature branch head {feature_head[:8]})", "INFO")
 
-                    t_res = api_call(f"projects/{pid}/repository/tags", "POST", {"tag_name": tag, "ref": FEATURE_BRANCH}, dry_run=dry_run)
-                    if dry_run:
-                        log(f"(dry-run) Would create tag '{tag}' on {FEATURE_BRANCH}", "DRY")
-                    else:
-                        if not isinstance(t_res, dict) or not t_res.get("error"):
-                            log(f"Created tag '{tag}' on {FEATURE_BRANCH}", "INFO")
-                            created_tags.add(tag)
-                            created_tag_commit = (t_res.get('commit') or {}).get('id') if isinstance(t_res, dict) else None
-                            if created_tag_commit:
-                                committed_shas.add(created_tag_commit)
-                                
-                                # Ask if user wants full deployment orchestration (or use --auto-deploy flag)
-                                should_deploy = auto_deploy or prompt_yes_no(f"Tag '{tag}' created. Do you want to wait for build and auto-deploy?", default=True, non_interactive=non_interactive)
-                                
-                                if should_deploy:
-                                    log(f"Starting deployment orchestration for tag '{tag}'...", "INFO")
-                                    
-                                    # Wait a few seconds for pipeline to be created
-                                    log("Waiting 10 seconds for pipeline to be triggered...", "INFO")
-                                    time.sleep(10)
-                                    
-                                    # Get the pipeline for this commit
-                                    pipeline = get_pipeline_for_commit(pid, created_tag_commit)
-                                    if not pipeline:
-                                        log(f"No pipeline found for commit {created_tag_commit[:8]}. Skipping orchestration.", "WARN")
-                                        continue
-                                    
-                                    pipeline_id = pipeline.get('id')
-                                    pipeline_url = pipeline.get('web_url', 'N/A')
-                                    log(f"Found pipeline {pipeline_id}: {pipeline_url}", "INFO")
-                                    
-                                    # Wait for build to complete
-                                    result = wait_for_pipeline_completion(pid, pipeline_id, timeout=1800, check_interval=30)
-                                    
-                                    if result['status'] != 'success':
-                                        log(f"Build {result['status']} for tag '{tag}'. Stopping orchestration.", "ERROR")
-                                        continue
-                                    
-                                    log(f"Build succeeded for tag '{tag}'! Proceeding to deployment...", "INFO")
-                                    
-                                    # Get all jobs from the pipeline
-                                    jobs = get_pipeline_jobs(pid, pipeline_id)
-                                    if not jobs:
-                                        log(f"No jobs found in pipeline {pipeline_id}. Skipping deployment.", "WARN")
-                                        continue
-                                    
-                                    # Step 1: Trigger eb-terminate job
-                                    terminate_job = find_job_by_name(jobs, 'eb-terminate')
-                                    if terminate_job:
-                                        terminate_job_id = terminate_job.get('id')
-                                        terminate_status = terminate_job.get('status')
-                                        
-                                        log(f"Found 'eb-terminate' job (ID: {terminate_job_id}, status: {terminate_status})", "INFO")
-                                        
-                                        if terminate_status == 'manual':
-                                            log("Triggering 'eb-terminate' job...", "INFO")
-                                            trigger_result = trigger_manual_job(pid, terminate_job_id, dry_run=dry_run)
-                                            
-                                            if not dry_run and (not isinstance(trigger_result, dict) or not trigger_result.get('error')):
-                                                # Wait for terminate job to complete
-                                                terminate_result = wait_for_job_completion(pid, terminate_job_id, timeout=900)
-                                                
-                                                if terminate_result['status'] != 'success':
-                                                    log(f"eb-terminate job {terminate_result['status']}. Stopping deployment.", "ERROR")
-                                                    continue
-                                                
-                                                log("eb-terminate job completed successfully!", "INFO")
-                                            elif dry_run:
-                                                log("(dry-run) Would wait for eb-terminate to complete", "DRY")
-                                        else:
-                                            log(f"eb-terminate job is not manual (status: {terminate_status}). Skipping trigger.", "WARN")
-                                    else:
-                                        log("'eb-terminate' job not found in pipeline. Skipping termination step.", "WARN")
-                                    
-                                    # Step 2: Trigger deployment job based on tag name
-                                    deploy_job_name = map_tag_to_deploy_job(tag)
-                                    if not deploy_job_name:
-                                        log(f"No deployment job mapping found for tag '{tag}'. Skipping deploy.", "WARN")
-                                        continue
-                                    
-                                    # Refresh jobs list to get updated statuses
-                                    jobs = get_pipeline_jobs(pid, pipeline_id)
-                                    deploy_job = find_job_by_name(jobs, deploy_job_name)
-                                    
-                                    if deploy_job:
-                                        deploy_job_id = deploy_job.get('id')
-                                        deploy_status = deploy_job.get('status')
-                                        
-                                        log(f"Found '{deploy_job_name}' job (ID: {deploy_job_id}, status: {deploy_status})", "INFO")
-                                        
-                                        if deploy_status == 'manual':
-                                            log(f"Triggering '{deploy_job_name}' job...", "INFO")
-                                            trigger_result = trigger_manual_job(pid, deploy_job_id, dry_run=dry_run)
-                                            
-                                            if not dry_run and (not isinstance(trigger_result, dict) or not trigger_result.get('error')):
-                                                # Wait for deploy job to complete
-                                                deploy_result = wait_for_job_completion(pid, deploy_job_id, timeout=1200)
-                                                
-                                                if deploy_result['status'] == 'success':
-                                                    log(f"[SUCCESS] Deployment completed successfully for tag '{tag}'!", "INFO")
-                                                    deployment_successful = True
-                                                else:
-                                                    log(f"Deployment {deploy_result['status']} for tag '{tag}'.", "ERROR")
-                                            elif dry_run:
-                                                log(f"(dry-run) Would wait for {deploy_job_name} to complete", "DRY")
-                                        else:
-                                            log(f"{deploy_job_name} job is not manual (status: {deploy_status}). Skipping trigger.", "WARN")
-                                    else:
-                                        log(f"'{deploy_job_name}' job not found in pipeline. Cannot deploy.", "ERROR")
-                                        log(f"Available jobs: {', '.join([j.get('name', 'unknown') for j in jobs])}", "INFO")
+                        exists_locally = tag_obj is not None
+                        if exists_locally:
+                            if tag_obj.get('protected'):
+                                log(f"Skipping PROTECTED tag '{tag}' - cannot delete.", "ERROR")
+                                continue
+                            log(f"Tag '{tag}' exists and will be deleted.", "INFO")
+                            api_call(f"projects/{pid}/repository/tags/{quoted_tag}", method="DELETE", dry_run=dry_run)
+
+                        t_res = api_call(f"projects/{pid}/repository/tags", "POST", {"tag_name": tag, "ref": FEATURE_BRANCH}, dry_run=dry_run)
+                        if dry_run:
+                            log(f"(dry-run) Would create tag '{tag}' on {FEATURE_BRANCH}", "DRY")
                         else:
-                            log(f"Failed to create tag '{tag}': {t_res.get('details')}", "ERROR")
+                            if not isinstance(t_res, dict) or not t_res.get("error"):
+                                log(f"Created tag '{tag}' on {FEATURE_BRANCH}", "INFO")
+                                created_tags.add(tag)
+                                created_tag_commit = (t_res.get('commit') or {}).get('id') if isinstance(t_res, dict) else None
+                                if created_tag_commit:
+                                    committed_shas.add(created_tag_commit)
+                                    
+                                    # Ask if user wants full deployment orchestration (or use --auto-deploy flag)
+                                    should_deploy = auto_deploy or prompt_yes_no(f"Tag '{tag}' created. Do you want to wait for build and auto-deploy?", default=True, non_interactive=non_interactive)
+                                    
+                                    if should_deploy:
+                                        log(f"Starting deployment orchestration for tag '{tag}'...", "INFO")
+                                        
+                                        # Wait a few seconds for pipeline to be created
+                                        log("Waiting 10 seconds for pipeline to be triggered...", "INFO")
+                                        time.sleep(10)
+                                        
+                                        # Get the pipeline for this commit
+                                        pipeline = get_pipeline_for_commit(pid, created_tag_commit)
+                                        if not pipeline:
+                                            log(f"No pipeline found for commit {created_tag_commit[:8]}. Skipping orchestration.", "WARN")
+                                            continue
+                                        
+                                        pipeline_id = pipeline.get('id')
+                                        pipeline_url = pipeline.get('web_url', 'N/A')
+                                        log(f"Found pipeline {pipeline_id}: {pipeline_url}", "INFO")
+                                        
+                                        # Wait for build to complete
+                                        result = wait_for_pipeline_completion(pid, pipeline_id, timeout=1800, check_interval=30)
+                                        
+                                        if result['status'] != 'success':
+                                            log(f"Build {result['status']} for tag '{tag}'. Stopping orchestration.", "ERROR")
+                                            continue
+                                        
+                                        log(f"Build succeeded for tag '{tag}'! Proceeding to deployment...", "INFO")
+                                        
+                                        # Get all jobs from the pipeline
+                                        jobs = get_pipeline_jobs(pid, pipeline_id)
+                                        if not jobs:
+                                            log(f"No jobs found in pipeline {pipeline_id}. Skipping deployment.", "WARN")
+                                            continue
+                                        
+                                        # Step 1: Trigger eb-terminate job
+                                        terminate_job = find_job_by_name(jobs, 'eb-terminate')
+                                        if terminate_job:
+                                            terminate_job_id = terminate_job.get('id')
+                                            terminate_status = terminate_job.get('status')
+                                            
+                                            log(f"Found 'eb-terminate' job (ID: {terminate_job_id}, status: {terminate_status})", "INFO")
+                                            
+                                            if terminate_status == 'manual':
+                                                log("Triggering 'eb-terminate' job...", "INFO")
+                                                trigger_result = trigger_manual_job(pid, terminate_job_id, dry_run=dry_run)
+                                                
+                                                if not dry_run and (not isinstance(trigger_result, dict) or not trigger_result.get('error')):
+                                                    # Wait for terminate job to complete
+                                                    terminate_result = wait_for_job_completion(pid, terminate_job_id, timeout=900)
+                                                    
+                                                    if terminate_result['status'] != 'success':
+                                                        log(f"eb-terminate job {terminate_result['status']}. Stopping deployment.", "ERROR")
+                                                        continue
+                                                    
+                                                    log("eb-terminate job completed successfully!", "INFO")
+                                                elif dry_run:
+                                                    log("(dry-run) Would wait for eb-terminate to complete", "DRY")
+                                            else:
+                                                log(f"eb-terminate job is not manual (status: {terminate_status}). Skipping trigger.", "WARN")
+                                        else:
+                                            log("'eb-terminate' job not found in pipeline. Skipping termination step.", "WARN")
+                                        
+                                        # Step 2: Trigger deployment job based on tag name
+                                        deploy_job_name = map_tag_to_deploy_job(tag)
+                                        if not deploy_job_name:
+                                            log(f"No deployment job mapping found for tag '{tag}'. Skipping deploy.", "WARN")
+                                            continue
+                                        
+                                        # Refresh jobs list to get updated statuses
+                                        jobs = get_pipeline_jobs(pid, pipeline_id)
+                                        deploy_job = find_job_by_name(jobs, deploy_job_name)
+                                        
+                                        if deploy_job:
+                                            deploy_job_id = deploy_job.get('id')
+                                            deploy_status = deploy_job.get('status')
+                                            
+                                            log(f"Found '{deploy_job_name}' job (ID: {deploy_job_id}, status: {deploy_status})", "INFO")
+                                            
+                                            if deploy_status == 'manual':
+                                                log(f"Triggering '{deploy_job_name}' job...", "INFO")
+                                                trigger_result = trigger_manual_job(pid, deploy_job_id, dry_run=dry_run)
+                                                
+                                                if not dry_run and (not isinstance(trigger_result, dict) or not trigger_result.get('error')):
+                                                    # Wait for deploy job to complete
+                                                    deploy_result = wait_for_job_completion(pid, deploy_job_id, timeout=1200)
+                                                    
+                                                    if deploy_result['status'] == 'success':
+                                                        log(f"[SUCCESS] Deployment completed successfully for tag '{tag}'!", "INFO")
+                                                        deployment_successful = True
+                                                    else:
+                                                        log(f"Deployment {deploy_result['status']} for tag '{tag}'.", "ERROR")
+                                                elif dry_run:
+                                                    log(f"(dry-run) Would wait for {deploy_job_name} to complete", "DRY")
+                                            else:
+                                                log(f"{deploy_job_name} job is not manual (status: {deploy_status}). Skipping trigger.", "WARN")
+                                        else:
+                                            log(f"'{deploy_job_name}' job not found in pipeline. Cannot deploy.", "ERROR")
+                                            log(f"Available jobs: {', '.join([j.get('name', 'unknown') for j in jobs])}", "INFO")
+                            else:
+                                log(f"Failed to create tag '{tag}': {t_res.get('details')}", "ERROR")
     
     # WORKFLOW 3: Create MR after successful deployment (NEW FLOW)
     if deployment_successful and not skip_mr:
@@ -1901,7 +1834,7 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
                         log("(dry-run) MR would be created.", "INFO")
             else:
                 log(f"Skipping MR creation because feature branch {FEATURE_BRANCH} does not exist.", "INFO")
-    elif not deployment_successful and not skip_mr and do_orch:
+    elif not deployment_successful and not skip_mr and enable_tag_deploy:
         log(f"[INFO] Skipping MR creation for {p_name} - deployment was not successful", "INFO")
     
     # Log completion time for this project
@@ -2070,7 +2003,7 @@ def main():
         else:
             log("No token found in .env or token.txt files", "WARN")
     
-    # Load BASE_URL
+    # Load BASE_URL from .env
     if args.base_url:
         BASE_URL = args.base_url.strip().rstrip('/')
         log(f"Using BASE_URL from command line: {BASE_URL}", "INFO")
@@ -2108,11 +2041,6 @@ def main():
         log("  4. Edit TOKEN constant in the script", "ERROR")
         sys.exit(1)
     
-    # Auto-detect company domain
-    company_domain = extract_company_domain_from_url(BASE_URL)
-    if company_domain:
-        log(f"Auto-detected company domain: {company_domain}", "INFO")
-    
     # Validate token
     log("Validating GitLab token...", "INFO")
     token_validation = validate_and_log_token_info(TOKEN, BASE_URL)
@@ -2144,7 +2072,7 @@ def main():
             log(f"Skipping {skipped_count} already completed project(s)", "INFO")
             dry_run_summary['total_projects'] = len(project_ids)
     
-    # WORKFLOW SELECTION (NEW!)
+    # WORKFLOW SELECTION
     skip_file_changes = False
     
     if args.workflow:
@@ -2183,51 +2111,16 @@ def main():
     else:
         log("[INFO] Workflow: MAKE CHANGES + DEPLOY + MR", "INFO")
     
-    # Dry-run mode selection
-    if not args.dry_run:
-        print("\n" + "=" * 70)
-        print("DRY-RUN MODE SELECTION")
-        print("=" * 70)
-        print("\nWould you like to run in DRY-RUN mode first?\n")
-        print("[DRY-RUN] DRY-RUN MODE (SIMULATION ONLY):")
-        print("   - Shows all proposed changes and diffs")
-        print("   - Simulates commits, MRs, tags, deployments")
-        print("   - Generates summary report")
-        print("   - NO actual changes made to GitLab")
-        print()
-        print("[ACTUAL] ACTUAL RUN MODE (MAKES REAL CHANGES):")
-        print("   - Creates real commits")
-        print("   - Creates real MRs")
-        print("   - Creates/recreates tags")
-        print("   - Triggers actual deployments")
-        print("   - [WARNING] This will modify GitLab!")
-        print()
-        
-        dry_run_choice = input("Run in DRY-RUN mode? [Y/n] (recommended: Y): ").strip().lower()
-        
-        if dry_run_choice in ('', 'y', 'yes'):
-            dry_run = True
-            print("\n" + "[DRY-RUN] " + "=" * 60)
-            print("[DRY-RUN] RUNNING IN DRY-RUN MODE (SIMULATION ONLY)")
-            print("[DRY-RUN] NO ACTUAL CHANGES WILL BE COMMITTED TO GITLAB")
-            print("[DRY-RUN] " + "=" * 60 + "\n")
-        else:
-            print("\n" + "[ACTUAL] " + "=" * 60)
-            print("[ACTUAL] RUNNING IN ACTUAL MODE - REAL CHANGES WILL BE MADE")
-            print("[ACTUAL] [WARNING] This will commit changes to GitLab!")
-            print("[ACTUAL] " + "=" * 60 + "\n")
-            
-            confirm = input("Are you sure you want to proceed with ACTUAL changes? [y/N]: ").strip().lower()
-            if confirm not in ('y', 'yes'):
-                log("User chose not to proceed with actual run. Exiting.", "INFO")
-                sys.exit(0)
-
+    # TWO-PHASE APPROACH: DRY RUN FIRST, THEN ACTUAL RUN
+    print("\n" + "=" * 70)
+    print("PHASE 1: DRY-RUN (SIMULATION)")
+    print("=" * 70)
+    print("\nRunning dry-run first to show what would change...")
+    print("NO actual changes will be made to GitLab in this phase.\n")
+    
     # File selection (only if not skipping file changes)
     global_choices = None
     if not skip_file_changes and not per_project_prompt:
-        if dry_run:
-            print("\n[DRY-RUN] Showing what WOULD be changed (no actual commits)")
-        
         raw_choices = input("Select updates to run for ALL projects (1:POM, 2:CI, 3:EB, 4:ALL, 0:EXIT), e.g. 1,2 or 4 or 0: ").replace(" ", "")
         
         if raw_choices == '0' or raw_choices.lower() == 'exit':
@@ -2246,9 +2139,9 @@ def main():
         log("[INFO] Skipping file selection (deploy-only mode)", "INFO")
         global_choices = []  # Empty choices for deploy-only mode
 
-    # Process projects
+    # PHASE 1: DRY RUN
     log("=" * 70, "INFO")
-    log("STARTING MIGRATION", "INFO")
+    log("STARTING DRY-RUN PHASE", "INFO")
     log("=" * 70, "INFO")
     
     process_in_batches(
@@ -2256,7 +2149,69 @@ def main():
         batch_size=args.batch_size,
         batch_delay=args.batch_delay,
         per_project_prompt=per_project_prompt,
-        dry_run=dry_run,
+        dry_run=True,  # Force dry-run
+        skip_mr=skip_mr,
+        show_full=show_full,
+        choices=global_choices,
+        force_tags=force_tags,
+        auto_deploy=False,  # Disable auto-deploy in dry-run
+        non_interactive=non_interactive,
+        state=state,
+        rollback_data=rollback_data,
+        dry_run_summary=dry_run_summary,
+        skip_file_changes=skip_file_changes,
+        enable_tag_deploy=False  # Disable tag/deploy in dry-run phase
+    )
+    
+    # Generate dry-run summary
+    generate_dry_run_summary(dry_run_summary)
+    
+    # PHASE 2: ASK IF USER WANTS TO COMMIT ACTUAL CHANGES
+    print("\n" + "=" * 70)
+    print("PHASE 2: ACTUAL RUN (OPTIONAL)")
+    print("=" * 70)
+    print("\nThe dry-run is complete. You've seen what would change.\n")
+    
+    if not prompt_yes_no("Do you want to commit these changes for REAL?", default=False, non_interactive=False):
+        log("User chose not to proceed with actual changes. Exiting.", "INFO")
+        sys.exit(0)
+    
+    # User wants to commit changes
+    print("\n" + "[ACTUAL] " + "=" * 60)
+    print("[ACTUAL] COMMITTING ACTUAL CHANGES TO GITLAB")
+    print("[ACTUAL] " + "=" * 60 + "\n")
+    
+    # Ask about tag/deploy
+    enable_tag_deploy = False
+    if prompt_yes_no("After committing changes, do you want to create tags and trigger deployments?", default=True, non_interactive=False):
+        enable_tag_deploy = True
+        log("Tag creation and deployment will be enabled after commits.", "INFO")
+    else:
+        log("Tag creation and deployment will be skipped.", "INFO")
+    
+    # Reset state for actual run
+    state = {
+        'completed_projects': [],
+        'failed_projects': [],
+        'skipped_projects': [],
+        'start_time': datetime.datetime.now().isoformat()
+    }
+    
+    rollback_data = {
+        'snapshots': []
+    }
+    
+    # ACTUAL RUN
+    log("=" * 70, "INFO")
+    log("STARTING ACTUAL MIGRATION", "INFO")
+    log("=" * 70, "INFO")
+    
+    process_in_batches(
+        project_ids,
+        batch_size=args.batch_size,
+        batch_delay=args.batch_delay,
+        per_project_prompt=per_project_prompt,
+        dry_run=False,  # Actual run
         skip_mr=skip_mr,
         show_full=show_full,
         choices=global_choices,
@@ -2265,18 +2220,15 @@ def main():
         non_interactive=non_interactive,
         state=state,
         rollback_data=rollback_data,
-        dry_run_summary=dry_run_summary if dry_run else None,
-        skip_file_changes=skip_file_changes  # NEW parameter
+        dry_run_summary=None,  # No summary for actual run
+        skip_file_changes=skip_file_changes,
+        enable_tag_deploy=enable_tag_deploy  # Enable/disable based on user choice
     )
     
     # Save rollback data
-    if rollback_data['snapshots'] and not dry_run:
+    if rollback_data['snapshots']:
         save_rollback_data(rollback_data)
         log(f"[SUCCESS] Rollback data saved. Use --rollback {ROLLBACK_FILE} to revert changes if needed.", "INFO")
-    
-    # Generate dry-run summary
-    if dry_run:
-        generate_dry_run_summary(dry_run_summary)
     
     log("=" * 70, "INFO")
     log("MIGRATION COMPLETE", "INFO")
