@@ -14,7 +14,7 @@ import logging
 from functools import wraps
 
 # --- CONFIGURATION (edit as needed) ---
-BASE_URL = "" # Will be loaded from .env
+BASE_URL = ""
 TOKEN = ""  # Will be loaded from .env or token.txt file
 PROJECT_IDS = [101, 102]  # Add all project IDs here or pass --projects
 
@@ -109,18 +109,6 @@ def load_state(filename):
 
 
 def create_rollback_snapshot(pid, p_name, branch_name, files_to_backup):
-    """
-    Create a rollback snapshot before making changes.
-    
-    Args:
-        pid: Project ID
-        p_name: Project name
-        branch_name: Branch to snapshot
-        files_to_backup: List of file paths to backup
-    
-    Returns:
-        Snapshot dict with rollback information
-    """
     snapshot = {
         'project_id': pid,
         'project_name': p_name,
@@ -203,13 +191,6 @@ def load_rollback_data(filename):
 
 
 def perform_rollback(rollback_file, dry_run=False):
-    """
-    Rollback changes from a previous migration.
-    
-    Args:
-        rollback_file: Path to rollback JSON file
-        dry_run: If True, only show what would be rolled back
-    """
     log("=" * 70, "INFO")
     log("ROLLBACK MODE", "INFO")
     log("=" * 70, "INFO")
@@ -290,15 +271,6 @@ def log(msg, level="INFO"):
 
 
 def load_token_from_file(debug=False):
-    """
-    Load GitLab token from .env or token.txt file in the script's directory.
-    
-    Priority:
-    1. .env file (looks for GITLAB_TOKEN=xxx or TOKEN=xxx)
-    2. token.txt file (reads entire content as token)
-    
-    Returns the token string or None if not found.
-    """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     
     if debug:
@@ -392,18 +364,6 @@ def get_pipeline_for_commit(pid, commit_sha):
 
 
 def wait_for_pipeline_completion(pid, pipeline_id, timeout=1800, check_interval=30):
-    """
-    Wait for a pipeline to complete (success, failed, or canceled).
-    
-    Args:
-        pid: Project ID
-        pipeline_id: Pipeline ID to monitor
-        timeout: Maximum time to wait in seconds (default: 30 minutes)
-        check_interval: How often to check status in seconds (default: 30s)
-    
-    Returns:
-        Dict with 'status' (success/failed/canceled/timeout) and 'pipeline' object
-    """
     log(f"Waiting for pipeline {pipeline_id} to complete (timeout: {timeout}s, checking every {check_interval}s)...", "INFO")
     
     start_time = time.time()
@@ -483,18 +443,6 @@ def trigger_manual_job(pid, job_id, dry_run=False):
 
 
 def wait_for_job_completion(pid, job_id, timeout=900, check_interval=15):
-    """
-    Wait for a specific job to complete.
-    
-    Args:
-        pid: Project ID
-        job_id: Job ID to monitor
-        timeout: Maximum time to wait in seconds (default: 15 minutes)
-        check_interval: How often to check status in seconds (default: 15s)
-    
-    Returns:
-        Dict with 'status' (success/failed/canceled/timeout) and 'job' object
-    """
     log(f"Waiting for job {job_id} to complete (timeout: {timeout}s)...", "INFO")
     
     start_time = time.time()
@@ -532,17 +480,6 @@ def wait_for_job_completion(pid, job_id, timeout=900, check_interval=15):
 
 
 def map_tag_to_deploy_job(tag_name):
-    """
-    Map tag name to corresponding deploy job name.
-    
-    Examples:
-    - dev -> eb-deploy-dev-azure
-    - azure-dev -> eb-deploy-dev-azure
-    - test -> eb-deploy-test-azure
-    - azure-test -> eb-deploy-test-azure
-    - performance -> eb-deploy-performance-azure
-    - azure-performance -> eb-deploy-performance-azure
-    """
     tag_lower = tag_name.lower().replace('azure-', '')
     
     deploy_jobs = {
@@ -789,18 +726,6 @@ def validate_and_log_token_info(token, base_url):
 
 
 def extract_company_domain_from_url(url):
-    """
-    Extract company domain from GitLab URL.
-    
-    Examples:
-    - https://gitlab.company-domain.com/api/v4 -> company-domain.com
-    - https://gitlab.acme.io/api/v4 -> acme.io
-    - https://git.internal.corp/api/v4 -> internal.corp
-    - https://gitlab.lfg/api/v4 -> lfg
-    - https://gitlab.lfg.local/api/v4 -> lfg.local
-    
-    Returns the domain or None if unable to extract.
-    """
     try:
         import re
         # Remove protocol and api path
@@ -989,20 +914,6 @@ def fetch_all_tags_for_project(pid, per_page=100):
 
 
 def filter_and_sort_deployment_tags(tags):
-    """
-    Filter tags to only include deployment-related tags (dev, test, performance variants)
-    and sort them in deployment order.
-    
-    Priority order:
-    1. dev, azure-dev
-    2. test, azure-test
-    3. performance, azure-performance
-    
-    Returns a dict with:
-    - 'sorted_tags': list of tags in priority order
-    - 'found_categories': dict showing which tag types were found
-    - 'missing_categories': list of missing standard tags
-    """
     if isinstance(tags, dict) and tags.get("error"):
         return {"error": True, "details": tags.get("details")}
     
@@ -1089,13 +1000,6 @@ def find_parent_version_in_pom(content):
 
 
 def detect_conflicts(pid, file_path, base_content, our_content, remote_ref):
-    """
-    Detect if there are conflicts between our changes and remote changes.
-    
-    Returns:
-        - None if no conflict detected
-        - dict with conflict info if conflict detected
-    """
     quoted_path = urllib.parse.quote(file_path, safe='')
     remote_res = api_call(f"projects/{pid}/repository/files/{quoted_path}?ref={urllib.parse.quote(remote_ref, safe='')}")
     
@@ -1176,10 +1080,6 @@ def extract_changed_line_numbers(unified_diff):
 
 
 def attempt_three_way_merge(base_content, our_content, remote_content):
-    """
-    Attempt a simple three-way merge.
-    Returns merged content if successful, None if conflicts exist.
-    """
     import difflib
     
     base_lines = base_content.splitlines(keepends=True)
@@ -1206,16 +1106,6 @@ def attempt_three_way_merge(base_content, our_content, remote_content):
 
 
 def handle_conflict(conflict_info, pid, p_name):
-    """
-    Handle detected conflicts by presenting options to the user.
-    
-    Returns:
-        - "skip": skip this file
-        - "ours": use our version
-        - "theirs": use remote version  
-        - "manual": user will manually merge
-        - content string: merged content to use
-    """
     file_path = conflict_info['file']
     
     if conflict_info['type'] == 'already_applied':
