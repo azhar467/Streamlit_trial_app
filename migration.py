@@ -14,7 +14,7 @@ import logging
 from functools import wraps
 
 # --- CONFIGURATION (edit as needed) ---
-BASE_URL = "https://gitlab.company-domain.com/api/v4"
+BASE_URL = "" # Will be loaded from .env
 TOKEN = ""  # Will be loaded from .env or token.txt file
 PROJECT_IDS = [101, 102]  # Add all project IDs here or pass --projects
 
@@ -109,6 +109,18 @@ def load_state(filename):
 
 
 def create_rollback_snapshot(pid, p_name, branch_name, files_to_backup):
+    """
+    Create a rollback snapshot before making changes.
+    
+    Args:
+        pid: Project ID
+        p_name: Project name
+        branch_name: Branch to snapshot
+        files_to_backup: List of file paths to backup
+    
+    Returns:
+        Snapshot dict with rollback information
+    """
     snapshot = {
         'project_id': pid,
         'project_name': p_name,
@@ -191,6 +203,13 @@ def load_rollback_data(filename):
 
 
 def perform_rollback(rollback_file, dry_run=False):
+    """
+    Rollback changes from a previous migration.
+    
+    Args:
+        rollback_file: Path to rollback JSON file
+        dry_run: If True, only show what would be rolled back
+    """
     log("=" * 70, "INFO")
     log("ROLLBACK MODE", "INFO")
     log("=" * 70, "INFO")
@@ -271,6 +290,15 @@ def log(msg, level="INFO"):
 
 
 def load_token_from_file(debug=False):
+    """
+    Load GitLab token from .env or token.txt file in the script's directory.
+    
+    Priority:
+    1. .env file (looks for GITLAB_TOKEN=xxx or TOKEN=xxx)
+    2. token.txt file (reads entire content as token)
+    
+    Returns the token string or None if not found.
+    """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     
     if debug:
@@ -364,6 +392,18 @@ def get_pipeline_for_commit(pid, commit_sha):
 
 
 def wait_for_pipeline_completion(pid, pipeline_id, timeout=1800, check_interval=30):
+    """
+    Wait for a pipeline to complete (success, failed, or canceled).
+    
+    Args:
+        pid: Project ID
+        pipeline_id: Pipeline ID to monitor
+        timeout: Maximum time to wait in seconds (default: 30 minutes)
+        check_interval: How often to check status in seconds (default: 30s)
+    
+    Returns:
+        Dict with 'status' (success/failed/canceled/timeout) and 'pipeline' object
+    """
     log(f"Waiting for pipeline {pipeline_id} to complete (timeout: {timeout}s, checking every {check_interval}s)...", "INFO")
     
     start_time = time.time()
@@ -492,6 +532,17 @@ def wait_for_job_completion(pid, job_id, timeout=900, check_interval=15):
 
 
 def map_tag_to_deploy_job(tag_name):
+    """
+    Map tag name to corresponding deploy job name.
+    
+    Examples:
+    - dev -> eb-deploy-dev-azure
+    - azure-dev -> eb-deploy-dev-azure
+    - test -> eb-deploy-test-azure
+    - azure-test -> eb-deploy-test-azure
+    - performance -> eb-deploy-performance-azure
+    - azure-performance -> eb-deploy-performance-azure
+    """
     tag_lower = tag_name.lower().replace('azure-', '')
     
     deploy_jobs = {
@@ -599,7 +650,7 @@ def generate_dry_run_summary(summary_data):
 
 def validate_and_log_token_info(token, base_url):
     """
-    Validate the GitLab token and log essential metadata.
+    Validate the GitLab token and log its metadata including expiry date, scopes, and access level.
     
     Returns:
         dict with 'valid' (bool) and 'info' (dict with token details)
@@ -609,6 +660,7 @@ def validate_and_log_token_info(token, base_url):
     
     try:
         # Call the personal access tokens endpoint to get token info
+        # Note: This requires the token to have 'read_api' scope
         url = f"{base_url.rstrip('/')}/personal_access_tokens/self"
         req = urllib.request.Request(url, method="GET")
         req.add_header("PRIVATE-TOKEN", token)
@@ -622,42 +674,23 @@ def validate_and_log_token_info(token, base_url):
                 'id': data.get('id'),
                 'name': data.get('name', 'N/A'),
                 'scopes': data.get('scopes', []),
+                'created_at': data.get('created_at'),
                 'expires_at': data.get('expires_at'),
                 'active': data.get('active', False),
                 'revoked': data.get('revoked', False),
-                'access_level': data.get('access_level', 'unknown')
+                'access_level': data.get('access_level', 'unknown')  # GitLab 15.0+
             }
             
-            # Log token information - simplified
+            # Log token information
             log("=" * 70, "INFO")
             log("GitLab Token Information:", "INFO")
             log("=" * 70, "INFO")
-            
-            # Active status
+            log(f"Token Name: {token_info['name']}", "INFO")
+            log(f"Token ID: {token_info['id']}", "INFO")
             log(f"Active: {'Yes' if token_info['active'] else 'No'}", "INFO")
+            log(f"Revoked: {'Yes' if token_info['revoked'] else 'No'}", "INFO")
             
-            # Expiry date
-            if token_info['expires_at']:
-                try:
-                    from datetime import datetime
-                    expiry_dt = datetime.fromisoformat(token_info['expires_at'].replace('Z', '+00:00'))
-                    now_dt = datetime.now(expiry_dt.tzinfo)
-                    expiry_str = expiry_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
-                    days_until_expiry = (expiry_dt - now_dt).days
-                    
-                    log(f"Expires At: {expiry_str} ({days_until_expiry} days)", "INFO")
-                except Exception:
-                    log(f"Expires At: {token_info['expires_at']}", "INFO")
-            else:
-                log("Expires At: Never", "INFO")
-            
-            # Scopes
-            if token_info['scopes']:
-                log(f"Scopes: {', '.join(token_info['scopes'])}", "INFO")
-            else:
-                log("Scopes: None", "INFO")
-            
-            # Access level (if available)
+            # Display access level if available
             access_level = token_info.get('access_level')
             if access_level and access_level != 'unknown':
                 # GitLab access levels: 10=Guest, 20=Reporter, 30=Developer, 40=Maintainer, 50=Owner
@@ -669,7 +702,66 @@ def validate_and_log_token_info(token, base_url):
                     50: 'Owner'
                 }
                 access_name = access_level_names.get(access_level, f'Level {access_level}')
-                log(f"Access Level: {access_name}", "INFO")
+                log(f"Access Level: {access_name} ({access_level})", "INFO")
+                
+                # Warn if insufficient permissions
+                if access_level < 30:  # Less than Developer
+                    log("[WARNING] Token has insufficient access level. Developer or Maintainer level required.", "WARN")
+            
+            # Parse and display expiry date
+            if token_info['expires_at']:
+                try:
+                    from datetime import datetime
+                    expiry_dt = datetime.fromisoformat(token_info['expires_at'].replace('Z', '+00:00'))
+                    now_dt = datetime.now(expiry_dt.tzinfo)
+                    
+                    # Format expiry date
+                    expiry_str = expiry_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+                    log(f"Expires At: {expiry_str}", "INFO")
+                    
+                    # Calculate days until expiry
+                    days_until_expiry = (expiry_dt - now_dt).days
+                    
+                    if days_until_expiry < 0:
+                        log(f"[ERROR] TOKEN EXPIRED {abs(days_until_expiry)} days ago!", "ERROR")
+                    elif days_until_expiry == 0:
+                        log(f"[WARNING] TOKEN EXPIRES TODAY!", "WARN")
+                    elif days_until_expiry <= 7:
+                        log(f"[WARNING] Token expires in {days_until_expiry} days", "WARN")
+                    elif days_until_expiry <= 30:
+                        log(f"Token expires in {days_until_expiry} days", "INFO")
+                    else:
+                        log(f"Token expires in {days_until_expiry} days", "INFO")
+                        
+                except Exception as e:
+                    log(f"Expires At: {token_info['expires_at']}", "INFO")
+                    log(f"Could not parse expiry date: {e}", "WARN")
+            else:
+                log("Expires At: Never (no expiration set)", "INFO")
+            
+            # Display scopes/permissions
+            if token_info['scopes']:
+                log(f"Permissions (Scopes): {', '.join(token_info['scopes'])}", "INFO")
+                
+                # Check for required scopes
+                required_scopes = ['api', 'write_repository', 'read_repository']
+                recommended_scopes = ['read_api']
+                
+                missing_required = [s for s in required_scopes if s not in token_info['scopes']]
+                missing_recommended = [s for s in recommended_scopes if s not in token_info['scopes']]
+                
+                if missing_required:
+                    log(f"[WARNING] Missing REQUIRED scopes: {', '.join(missing_required)}", "WARN")
+                    log("   Script may fail without these permissions!", "WARN")
+                
+                if missing_recommended:
+                    log(f"[INFO] Missing recommended scopes: {', '.join(missing_recommended)}", "INFO")
+                    log("   Some features may not work optimally", "INFO")
+                
+                if not missing_required and not missing_recommended:
+                    log("[SUCCESS] All required and recommended scopes present", "INFO")
+            else:
+                log("Permissions (Scopes): None detected (may have full access)", "WARN")
             
             log("=" * 70, "INFO")
             
@@ -677,21 +769,61 @@ def validate_and_log_token_info(token, base_url):
             
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            # Endpoint not available - older GitLab or missing scope
-            log("=" * 70, "INFO")
-            log("Could not fetch detailed token information", "INFO")
-            log("Token may be missing 'read_api' scope or GitLab version doesn't support this endpoint", "INFO")
-            log("=" * 70, "INFO")
+            # Endpoint not available - older GitLab version or token doesn't have read_api scope
+            log("=" * 70, "WARN")
+            log("Could not fetch detailed token information", "WARN")
+            log("This may be due to:", "WARN")
+            log("  - Token missing 'read_api' scope", "WARN")
+            log("  - GitLab version doesn't support this endpoint", "WARN")
+            log("=" * 70, "WARN")
             return {'valid': True, 'info': None}
         elif e.code == 401:
             log("Token validation failed: Invalid or expired token", "ERROR")
             return {'valid': False, 'info': None}
         else:
-            log(f"Could not validate token: HTTP {e.code}", "INFO")
-            return {'valid': True, 'info': None}
+            log(f"Error validating token: HTTP {e.code}", "WARN")
+            return {'valid': True, 'info': None}  # Assume valid, continue
     except Exception as e:
-        log(f"Could not fetch token information: {e}", "INFO")
-        return {'valid': True, 'info': None}
+        log(f"Error fetching token information: {e}", "WARN")
+        return {'valid': True, 'info': None}  # Assume valid, continue
+
+
+def extract_company_domain_from_url(url):
+    """
+    Extract company domain from GitLab URL.
+    
+    Examples:
+    - https://gitlab.company-domain.com/api/v4 -> company-domain.com
+    - https://gitlab.acme.io/api/v4 -> acme.io
+    - https://git.internal.corp/api/v4 -> internal.corp
+    - https://gitlab.lfg/api/v4 -> lfg
+    - https://gitlab.lfg.local/api/v4 -> lfg.local
+    
+    Returns the domain or None if unable to extract.
+    """
+    try:
+        import re
+        # Remove protocol and api path
+        cleaned = re.sub(r'^https?://', '', url)
+        cleaned = re.sub(r'/api/.*$', '', cleaned)
+        cleaned = re.sub(r':\d+$', '', cleaned)  # Remove port if present
+        
+        # Extract domain (remove 'gitlab.' prefix if present)
+        if cleaned.startswith('gitlab.'):
+            domain = cleaned[7:]  # Remove 'gitlab.' prefix
+        elif cleaned.startswith('git.'):
+            domain = cleaned[4:]  # Remove 'git.' prefix
+        else:
+            domain = cleaned
+        
+        # Return domain if it looks valid
+        # Accept even short domains like 'lfg' (minimum 2 chars)
+        if len(domain) >= 2:
+            return domain
+        
+        return None
+    except Exception:
+        return None
 
 
 def retry(tries=3, delay=1, backoff=2, allowed_exceptions=(Exception,)):
@@ -857,6 +989,20 @@ def fetch_all_tags_for_project(pid, per_page=100):
 
 
 def filter_and_sort_deployment_tags(tags):
+    """
+    Filter tags to only include deployment-related tags (dev, test, performance variants)
+    and sort them in deployment order.
+    
+    Priority order:
+    1. dev, azure-dev
+    2. test, azure-test
+    3. performance, azure-performance
+    
+    Returns a dict with:
+    - 'sorted_tags': list of tags in priority order
+    - 'found_categories': dict showing which tag types were found
+    - 'missing_categories': list of missing standard tags
+    """
     if isinstance(tags, dict) and tags.get("error"):
         return {"error": True, "details": tags.get("details")}
     
@@ -942,7 +1088,19 @@ def find_parent_version_in_pom(content):
     return None
 
 
-def detect_conflicts(pid, file_path, base_content, our_content, remote_ref):
+def detect_conflicts(pid, file_path, base_content, our_content, remote_ref, dry_run=False):
+    """
+    Detect if there are conflicts between our changes and remote changes.
+    
+    Returns:
+        - None if no conflict detected
+        - dict with conflict info if conflict detected
+    """
+    if dry_run:
+        # Skip conflict detection in dry-run mode
+        log(f"(dry-run) Skipping conflict detection for {file_path}", "DRY")
+        return None
+    
     quoted_path = urllib.parse.quote(file_path, safe='')
     remote_res = api_call(f"projects/{pid}/repository/files/{quoted_path}?ref={urllib.parse.quote(remote_ref, safe='')}")
     
@@ -1053,6 +1211,16 @@ def attempt_three_way_merge(base_content, our_content, remote_content):
 
 
 def handle_conflict(conflict_info, pid, p_name):
+    """
+    Handle detected conflicts by presenting options to the user.
+    
+    Returns:
+        - "skip": skip this file
+        - "ours": use our version
+        - "theirs": use remote version  
+        - "manual": user will manually merge
+        - content string: merged content to use
+    """
     file_path = conflict_info['file']
     
     if conflict_info['type'] == 'already_applied':
@@ -1122,12 +1290,6 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
     project_info = api_call(f"projects/{pid}")
     p_name = project_info.get('name', f"ID:{pid}") if isinstance(project_info, dict) else f"ID:{pid}"
     log(f"--- Processing: {p_name} (project id: {pid}) ---")
-    
-    # Inform user about dry-run mode behavior
-    if dry_run:
-        log(f"[DRY-RUN] Running in simulation mode for {p_name}", "INFO")
-        log(f"[DRY-RUN] No actual changes will be made to GitLab", "INFO")
-    
     actions = []
 
     committed_shas = set()
@@ -1242,100 +1404,89 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
                     if isinstance(br_check, dict) and "commit" in br_check:
                         branch_head_before = (br_check.get("commit") or {}).get("id")
 
-                # Conflict detection (skip in dry-run if feature branch doesn't exist)
-                if dry_run and not (isinstance(br_check, dict) and "name" in br_check):
-                    log(f"[DRY-RUN] Skipping conflict detection - feature branch doesn't exist yet", "INFO")
+                # Conflict detection (skip in dry-run)
+                if not dry_run:
+                    log(f"Checking for conflicts on {FEATURE_BRANCH}...", "INFO")
                     conflicts_detected = []
-                else:
-                    log(f"Checking for conflicts on {FEATURE_BRANCH if isinstance(br_check, dict) and 'name' in br_check else current_ref}...", "INFO")
-                    conflicts_detected = []
-                    
-                    # Use current_ref for conflict detection if feature branch doesn't exist
-                    conflict_check_ref = FEATURE_BRANCH if isinstance(br_check, dict) and "name" in br_check else current_ref
                     
                     for act in actions:
                         file_path = act['file_path']
                         base_content = act['old_content']
                         our_content = act['content']
                         
-                        conflict = detect_conflicts(pid, file_path, base_content, our_content, conflict_check_ref)
+                        conflict = detect_conflicts(pid, file_path, base_content, our_content, FEATURE_BRANCH, dry_run=dry_run)
                         if conflict:
                             conflicts_detected.append((act, conflict))
-                
-                if conflicts_detected:
-                    log(f"Found {len(conflicts_detected)} file(s) with potential conflicts.", "WARN")
                     
-                    # Handle each conflict
-                    for act, conflict in conflicts_detected:
-                        try:
-                            resolution = handle_conflict(conflict, pid, p_name)
-                            
-                            if resolution == "skip":
-                                actions = [a for a in actions if a['file_path'] != act['file_path']]
-                            elif resolution == "ours":
-                                pass
-                            elif resolution == "theirs":
-                                actions = [a for a in actions if a['file_path'] != act['file_path']]
-                            elif isinstance(resolution, str) and resolution not in ["skip", "ours", "theirs"]:
-                                for a in actions:
-                                    if a['file_path'] == act['file_path']:
-                                        a['content'] = resolution
-                                        break
-                        except Exception as e:
-                            log(f"Conflict handling aborted: {e}", "ERROR")
-                            return
+                    if conflicts_detected:
+                        log(f"Found {len(conflicts_detected)} file(s) with potential conflicts.", "WARN")
+                        
+                        # Handle each conflict
+                        for act, conflict in conflicts_detected:
+                            try:
+                                resolution = handle_conflict(conflict, pid, p_name)
+                                
+                                if resolution == "skip":
+                                    actions = [a for a in actions if a['file_path'] != act['file_path']]
+                                elif resolution == "ours":
+                                    pass
+                                elif resolution == "theirs":
+                                    actions = [a for a in actions if a['file_path'] != act['file_path']]
+                                elif isinstance(resolution, str) and resolution not in ["skip", "ours", "theirs"]:
+                                    for a in actions:
+                                        if a['file_path'] == act['file_path']:
+                                            a['content'] = resolution
+                                            break
+                            except Exception as e:
+                                log(f"Conflict handling aborted: {e}", "ERROR")
+                                return
+                    else:
+                        log("No conflicts detected.", "INFO")
                 else:
-                    log("No conflicts detected.", "INFO")
+                    log(f"(dry-run) Skipping conflict detection", "DRY")
+                    conflicts_detected = []
 
                 if not actions:
                     log(f"No remaining changes to commit for {p_name} after conflict resolution.", "INFO")
                 else:
                     commit_actions = []
-                    
-                    # Determine which ref to check files on
-                    # In dry-run, feature branch might not exist, so check current_ref
-                    check_ref = FEATURE_BRANCH if not dry_run and isinstance(br_check, dict) and "name" in br_check else current_ref
-                    
-                    for act in actions:
-                        file_path = act['file_path']
-                        quoted_path = urllib.parse.quote(file_path, safe='')
-                        res = api_call(f"projects/{pid}/repository/files/{quoted_path}?ref={urllib.parse.quote(check_ref, safe='')}")
-                        desired = act['content']
-                        if isinstance(res, dict) and res.get("error"):
-                            # File doesn't exist on the target branch - will be created
-                            log(f"File {file_path} not found on {check_ref}, will be created", "INFO")
-                            commit_actions.append({"action": "create", "file_path": file_path, "content": desired})
-                        elif "content" in res:
-                            remote_content = base64.b64decode(res['content']).decode('utf-8')
-                            if remote_content == desired:
-                                log(f"Skipping {file_path}: remote already matches desired content.", "INFO")
-                                continue
+                    if dry_run:
+                        # In dry-run, just use all actions without checking remote state
+                        commit_actions = [{"action": act["action"], "file_path": act["file_path"], "content": act["content"]} for act in actions]
+                        log(f"(dry-run) Would commit {len(commit_actions)} file(s)", "DRY")
+                    else:
+                        for act in actions:
+                            file_path = act['file_path']
+                            quoted_path = urllib.parse.quote(file_path, safe='')
+                            res = api_call(f"projects/{pid}/repository/files/{quoted_path}?ref={urllib.parse.quote(FEATURE_BRANCH, safe='')}")
+                            desired = act['content']
+                            if isinstance(res, dict) and res.get("error"):
+                                log(f"Error fetching {file_path} on {FEATURE_BRANCH}: {res.get('details')}", "WARN")
+                                commit_actions.append({"action": "create", "file_path": file_path, "content": desired})
+                            elif "content" in res:
+                                remote_content = base64.b64decode(res['content']).decode('utf-8')
+                                if remote_content == desired:
+                                    log(f"Skipping {file_path}: remote already matches desired content.", "INFO")
+                                    continue
+                                else:
+                                    if file_path == "pom.xml":
+                                        remote_ver_str = find_parent_version_in_pom(remote_content)
+                                        remote_ver = parse_version(remote_ver_str)
+                                        desired_ver = parse_version(TARGET_PARENT_VERSION)
+                                        if remote_ver and desired_ver and remote_ver > desired_ver:
+                                            log(f"Remote parent version {'.'.join(map(str,remote_ver))} is newer than desired {TARGET_PARENT_VERSION}.", "WARN")
+                                            if not prompt_yes_no("Remote parent version appears newer. Overwrite (downgrade) anyway?", default=False, non_interactive=non_interactive):
+                                                log(f"Skipping update of {file_path} due to newer remote version.", "INFO")
+                                                continue
+                                    commit_actions.append({"action": "update", "file_path": file_path, "content": desired})
                             else:
-                                if file_path == "pom.xml":
-                                    remote_ver_str = find_parent_version_in_pom(remote_content)
-                                    remote_ver = parse_version(remote_ver_str)
-                                    desired_ver = parse_version(TARGET_PARENT_VERSION)
-                                    if remote_ver and desired_ver and remote_ver > desired_ver:
-                                        log(f"Remote parent version {'.'.join(map(str,remote_ver))} is newer than desired {TARGET_PARENT_VERSION}.", "WARN")
-                                        if not prompt_yes_no("Remote parent version appears newer. Overwrite (downgrade) anyway?", default=False, non_interactive=non_interactive):
-                                            log(f"Skipping update of {file_path} due to newer remote version.", "INFO")
-                                            continue
-                                log(f"File {file_path} will be updated on {check_ref}", "INFO")
-                                commit_actions.append({"action": "update", "file_path": file_path, "content": desired})
-                        else:
-                            log(f"{file_path} not found on {check_ref} (or fetch error). Will attempt to create it.", "INFO")
-                            commit_actions.append({"action": "create", "file_path": file_path, "content": desired})
+                                log(f"{file_path} not found on {FEATURE_BRANCH} (or fetch error). Will attempt to create it.", "INFO")
+                                commit_actions.append({"action": "create", "file_path": file_path, "content": desired})
 
                     if not commit_actions:
                         log(f"No remaining changes to commit for {p_name}; skipping commit.", "INFO")
                     else:
-                        # Log what will be committed in dry-run mode
-                        if dry_run:
-                            log(f"[DRY-RUN] Would commit {len(commit_actions)} file(s) to {FEATURE_BRANCH}:", "INFO")
-                            for ca in commit_actions:
-                                log(f"[DRY-RUN]   - {ca['action'].upper()}: {ca['file_path']}", "INFO")
-                        
-                        if branch_head_before and not dry_run:
+                        if not dry_run and branch_head_before:
                             br_now = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
                             branch_head_now = (br_now.get("commit") or {}).get("id") if isinstance(br_now, dict) else None
                             if branch_head_now and branch_head_now != branch_head_before:
@@ -1956,6 +2107,11 @@ def main():
         log("  3. token.txt file in script directory", "ERROR")
         log("  4. Edit TOKEN constant in the script", "ERROR")
         sys.exit(1)
+    
+    # Auto-detect company domain
+    company_domain = extract_company_domain_from_url(BASE_URL)
+    if company_domain:
+        log(f"Auto-detected company domain: {company_domain}", "INFO")
     
     # Validate token
     log("Validating GitLab token...", "INFO")
