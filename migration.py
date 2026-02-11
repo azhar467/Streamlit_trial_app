@@ -118,18 +118,6 @@ def load_state(filename):
 
 
 def create_rollback_snapshot(pid, p_name, branch_name, files_to_backup):
-    """
-    Create a rollback snapshot before making changes.
-    
-    Args:
-        pid: Project ID
-        p_name: Project name
-        branch_name: Branch to snapshot
-        files_to_backup: List of file paths to backup
-    
-    Returns:
-        Snapshot dict with rollback information
-    """
     snapshot = {
         'project_id': pid,
         'project_name': p_name,
@@ -213,12 +201,6 @@ def load_rollback_data(filename):
 
 
 def perform_rollback(rollback_file):
-    """
-    Rollback changes from a previous migration.
-    
-    Args:
-        rollback_file: Path to rollback JSON file
-    """
     log("=" * 70, "INFO")
     log("ROLLBACK MODE", "INFO")
     log("=" * 70, "INFO")
@@ -303,15 +285,6 @@ def log(msg, level="INFO"):
 
 
 def load_token_from_file(debug=False):
-    """
-    Load GitLab token from .env or token.txt file in the script's directory.
-    
-    Priority:
-    1. .env file (looks for GITLAB_TOKEN=xxx or TOKEN=xxx)
-    2. token.txt file (reads entire content as token)
-    
-    Returns the token string or None if not found.
-    """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     
     if debug:
@@ -497,18 +470,6 @@ def trigger_manual_job(pid, job_id):
 
 
 def wait_for_job_completion(pid, job_id, timeout=900, check_interval=15):
-    """
-    Wait for a specific job to complete.
-    
-    Args:
-        pid: Project ID
-        job_id: Job ID to monitor
-        timeout: Maximum time to wait in seconds (default: 15 minutes)
-        check_interval: How often to check status in seconds (default: 15s)
-    
-    Returns:
-        Dict with 'status' (success/failed/canceled/timeout) and 'job' object
-    """
     log(f"Waiting for job {job_id} to complete (timeout: {timeout}s)...", "INFO")
     
     start_time = time.time()
@@ -551,17 +512,6 @@ def wait_for_job_completion(pid, job_id, timeout=900, check_interval=15):
 
 
 def map_tag_to_deploy_job(tag_name):
-    """
-    Map tag name to corresponding deploy job name.
-    
-    Examples:
-    - dev -> eb-deploy-dev-azure
-    - azure-dev -> eb-deploy-dev-azure
-    - test -> eb-deploy-test-azure
-    - azure-test -> eb-deploy-test-azure
-    - performance -> eb-deploy-performance-azure
-    - azure-performance -> eb-deploy-performance-azure
-    """
     tag_lower = tag_name.lower().replace('azure-', '')
     
     deploy_jobs = {
@@ -574,12 +524,6 @@ def map_tag_to_deploy_job(tag_name):
 
 
 def validate_and_log_token_info(token, base_url):
-    """
-    Validate the GitLab token and log its metadata including expiry date and access level.
-    
-    Returns:
-        dict with 'valid' (bool) and 'info' (dict with token details)
-    """
     if not token:
         return {'valid': False, 'info': None}
     
@@ -838,20 +782,6 @@ def fetch_all_tags_for_project(pid, per_page=100):
 
 
 def filter_and_sort_deployment_tags(tags):
-    """
-    Filter tags to only include deployment-related tags (dev, test, performance variants)
-    and sort them in deployment order.
-    
-    Priority order:
-    1. dev, azure-dev
-    2. test, azure-test
-    3. performance, azure-performance
-    
-    Returns a dict with:
-    - 'sorted_tags': list of tags in priority order
-    - 'found_categories': dict showing which tag types were found
-    - 'missing_categories': list of missing standard tags
-    """
     if isinstance(tags, dict) and tags.get("error"):
         return {"error": True, "details": tags.get("details")}
     
@@ -1094,16 +1024,6 @@ def attempt_three_way_merge(base_content, our_content, remote_content):
 
 
 def handle_conflict(conflict_info, pid, p_name):
-    """
-    Handle detected conflicts by presenting options to the user.
-    
-    Returns:
-        - "skip": skip this file
-        - "ours": use our version
-        - "theirs": use remote version  
-        - "manual": user will manually merge
-        - content string: merged content to use
-    """
     file_path = conflict_info['file']
     
     if conflict_info['type'] == 'already_applied':
@@ -1174,6 +1094,7 @@ def handle_conflict(conflict_info, pid, p_name):
             return "ours"
         elif choice == '2':
             log(f"Using remote version for {file_path}", "INFO")
+            log(f"Remote version will be preserved for {file_path}. Our changes will NOT be committed.", "INFO")
             return "theirs"
         elif choice == '3':
             log(f"Skipping {file_path}", "INFO")
@@ -1245,7 +1166,7 @@ def create_mr_for_project(pid, p_name, rollback_data):
         return {'success': False, 'idempotent': False, 'url': None}
 
 
-def process_project(pid, choices=None, show_full=True, rollback_data=None, mode='full', state=None):
+def process_project(pid, choices=None, show_full=True, rollback_data=None, mode='full', state=None, project_timings=None):
     """
     Process a single project with file changes and/or deployment.
     
@@ -1256,6 +1177,7 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
         rollback_data: Dict to store rollback snapshots
         mode: 'full' (changes+deploy/MR), 'mr_only' (just create MR), 'deploy_only' (just deploy)
         state: State dict for tracking progress
+        project_timings: List to track project execution times
     
     Returns:
         Dict with status information
@@ -1296,9 +1218,11 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
             # Update state
             if state is not None:
                 if mr_result['success']:
-                    state['completed_projects'].append(pid)
+                    if pid not in state['completed_projects']:
+                        state['completed_projects'].append(pid)
                 else:
-                    state['failed_projects'].append(pid)
+                    if pid not in state['failed_projects']:
+                        state['failed_projects'].append(pid)
                 save_state(state)
             
             return result
@@ -1377,7 +1301,8 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
                 if not prompt_yes_no(f"Commit these changes for {p_name}?", default=True):
                     log(f"User skipped commit for {p_name}", "INFO")
                     if state is not None:
-                        state['skipped_projects'].append(pid)
+                        if pid not in state['skipped_projects']:
+                            state['skipped_projects'].append(pid)
                         save_state(state)
                     return result
                 
@@ -1402,7 +1327,8 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
                         result['error'] = "Failed to create feature branch"
                         
                         if state is not None:
-                            state['failed_projects'].append(pid)
+                            if pid not in state['failed_projects']:
+                                state['failed_projects'].append(pid)
                             save_state(state)
                         
                         return result
@@ -1444,7 +1370,8 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
                             result['error'] = str(e)
                             
                             if state is not None:
-                                state['failed_projects'].append(pid)
+                                if pid not in state['failed_projects']:
+                                    state['failed_projects'].append(pid)
                                 save_state(state)
                             
                             return result
@@ -1498,7 +1425,8 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
                                 perform_rollback(rollback_file)
                             
                             if state is not None:
-                                state['failed_projects'].append(pid)
+                                if pid not in state['failed_projects']:
+                                    state['failed_projects'].append(pid)
                                 save_state(state)
                             
                             return result
@@ -1559,9 +1487,11 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
         # Update state
         if state is not None:
             if result['success']:
-                state['completed_projects'].append(pid)
+                if pid not in state['completed_projects']:
+                    state['completed_projects'].append(pid)
             else:
-                state['failed_projects'].append(pid)
+                if pid not in state['failed_projects']:
+                    state['failed_projects'].append(pid)
             save_state(state)
         
         # Log completion time
@@ -1576,7 +1506,7 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
             log(f"[COMPLETE] Completed {p_name} in {seconds}s", "INFO")
         
         # Track timing for summary
-        if 'project_timings' in globals():
+        if project_timings is not None:
             project_timings.append((p_name, project_duration))
         
         return result
@@ -1592,7 +1522,8 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
             perform_rollback(rollback_file)
         
         if state is not None:
-            state['failed_projects'].append(pid)
+            if pid not in state['failed_projects']:
+                state['failed_projects'].append(pid)
             save_state(state)
         
         return result
@@ -1796,7 +1727,7 @@ def handle_deployment(pid, p_name):
     return {'success': deployment_successful, 'idempotent_tags': idempotent_tags}
 
 
-def bulk_create_mrs(project_ids, rollback_data, state):
+def bulk_create_mrs(project_ids, rollback_data, state, project_timings=None):
     """
     Create merge requests for all projects in bulk.
     
@@ -1804,6 +1735,7 @@ def bulk_create_mrs(project_ids, rollback_data, state):
         project_ids: List of project IDs
         rollback_data: Dict to store rollback snapshots
         state: State dict for tracking progress
+        project_timings: List to track project execution times
     
     Returns:
         Dict with success/failure counts
@@ -1828,7 +1760,7 @@ def bulk_create_mrs(project_ids, rollback_data, state):
             break
         
         try:
-            result = process_project(pid, mode='mr_only', rollback_data=rollback_data, state=state)
+            result = process_project(pid, mode='mr_only', rollback_data=rollback_data, state=state, project_timings=project_timings)
             
             if result.get('interrupted'):
                 results['interrupted'] += 1
@@ -2059,7 +1991,7 @@ def main():
     try:
         if mode == 'mr_bulk':
             # BULK MR CREATION
-            bulk_create_mrs(project_ids, rollback_data, state)
+            bulk_create_mrs(project_ids, rollback_data, state, project_timings)
             
         elif mode == 'deploy_only':
             # DEPLOY ONLY MODE
@@ -2071,7 +2003,7 @@ def main():
                 if INTERRUPTED:
                     log("Migration interrupted", "WARN")
                     break
-                process_project(pid, mode='deploy_only', rollback_data=rollback_data, state=state)
+                process_project(pid, mode='deploy_only', rollback_data=rollback_data, state=state, project_timings=project_timings)
             
         else:
             # FULL MIGRATION MODE
@@ -2106,7 +2038,7 @@ def main():
                     break
                     
                 try:
-                    process_project(pid, choices=global_choices, show_full=show_full, rollback_data=rollback_data, mode='full', state=state)
+                    process_project(pid, choices=global_choices, show_full=show_full, rollback_data=rollback_data, mode='full', state=state, project_timings=project_timings)
                 except KeyboardInterrupt:
                     log("\n[INTERRUPT] Keyboard interrupt received", "WARN")
                     INTERRUPTED = True
@@ -2127,11 +2059,15 @@ def main():
             log(f"To resume, run: python3 {sys.argv[0]} --resume {state_file}", "INFO")
         
         # Execution timing summary
-        if project_timings:
+        if project_timings and len(project_timings) > 0:
             script_end_time = time.time()
             total_runtime = script_end_time - script_start_time
-            avg_time = sum(t[1] for t in project_timings) / len(project_timings) if project_timings else 0
-            slowest = max(project_timings, key=lambda x: x[1]) if project_timings else (None, 0)
+            
+            # Safe average calculation
+            avg_time = sum(t[1] for t in project_timings) / len(project_timings)
+            
+            # Safe slowest project calculation
+            slowest = max(project_timings, key=lambda x: x[1])
             
             log("\n" + "=" * 70, "INFO")
             log("EXECUTION TIMING SUMMARY", "INFO")
@@ -2142,7 +2078,7 @@ def main():
             log(f"Total runtime: {total_minutes}m {total_seconds}s", "INFO")
             log(f"Average per project: {int(avg_time)}s", "INFO")
             
-            if slowest[0]:
+            if slowest and slowest[0]:
                 log(f"Slowest project: {slowest[0]} ({int(slowest[1])}s)", "INFO")
         
         log("\n" + "=" * 70, "INFO")
