@@ -11,6 +11,7 @@ import sys
 import time
 import os
 import logging
+import signal
 from functools import wraps
 
 # --- CONFIGURATION (edit as needed) ---
@@ -34,12 +35,12 @@ AUTO_ROLLBACK_ON_FAILURE = True
 STATE_FILE = None
 ROLLBACK_FILE = None
 FILE_LOGGER = None
+INTERRUPTED = False
 
 # Log directories
 LOG_DIR_MIGRATION = "migration_logs"
 LOG_DIR_ROLLBACK = "rollback_logs"
 LOG_DIR_STATE = "state_logs"
-LOG_DIR_DRY_RUN = "dry_run_logs"
 
 
 def setup_file_logging(log_dir=LOG_DIR_MIGRATION):
@@ -75,6 +76,13 @@ def setup_file_logging(log_dir=LOG_DIR_MIGRATION):
     return log_file
 
 
+def signal_handler(signum, frame):
+    """Handle interrupt signals gracefully."""
+    global INTERRUPTED
+    INTERRUPTED = True
+    log("\n[INTERRUPT] Received interrupt signal. Saving state...", "WARN")
+
+
 def save_state(state_data, filename=None):
     """Save migration state to file for resume capability."""
     global STATE_FILE
@@ -91,6 +99,7 @@ def save_state(state_data, filename=None):
         json.dump(state_data, f, indent=2)
     
     log(f"State saved to {filename}", "DEBUG")
+    return filename
 
 
 def load_state(filename):
@@ -184,6 +193,7 @@ def save_rollback_data(rollback_data, filename=None):
         json.dump(rollback_data, f, indent=2)
     
     log(f"Rollback data saved to {filename}", "INFO")
+    return filename
 
 
 def load_rollback_data(filename):
@@ -202,13 +212,12 @@ def load_rollback_data(filename):
         return None
 
 
-def perform_rollback(rollback_file, dry_run=False):
+def perform_rollback(rollback_file):
     """
     Rollback changes from a previous migration.
     
     Args:
         rollback_file: Path to rollback JSON file
-        dry_run: If True, only show what would be rolled back
     """
     log("=" * 70, "INFO")
     log("ROLLBACK MODE", "INFO")
@@ -216,16 +225,19 @@ def perform_rollback(rollback_file, dry_run=False):
     
     data = load_rollback_data(rollback_file)
     if not data:
-        return
+        return False
     
     snapshots = data.get('snapshots', [])
     
     if not snapshots:
         log("No snapshots found in rollback file", "WARN")
-        return
+        return False
     
     log(f"Found {len(snapshots)} project(s) to rollback", "INFO")
     log(f"Rollback file created: {data.get('created_at', 'unknown')}", "INFO")
+    
+    success_count = 0
+    fail_count = 0
     
     for snapshot in snapshots:
         pid = snapshot['project_id']
@@ -234,12 +246,8 @@ def perform_rollback(rollback_file, dry_run=False):
         
         log(f"\n--- Rollback: {p_name} (ID: {pid}) ---", "INFO")
         
-        if dry_run:
-            log(f"(dry-run) Would rollback {p_name} to commit {snapshot.get('commit_sha', 'unknown')[:8]}", "INFO")
-            log(f"(dry-run) Would restore {len(snapshot.get('files', {}))} file(s)", "INFO")
-            continue
-        
         # Restore files
+        project_success = True
         for file_path, file_data in snapshot.get('files', {}).items():
             if not file_data.get('exists'):
                 log(f"File {file_path} did not exist before, skipping restore", "INFO")
@@ -252,9 +260,6 @@ def perform_rollback(rollback_file, dry_run=False):
             
             try:
                 # Update file to previous content
-                encoded_content = base64.b64encode(content.encode('utf-8')).decode('utf-8')
-                quoted_path = urllib.parse.quote(file_path, safe='')
-                
                 commit_data = {
                     "branch": branch,
                     "commit_message": f"Rollback: Restore {file_path} to pre-migration state",
@@ -270,12 +275,20 @@ def perform_rollback(rollback_file, dry_run=False):
                 
             except Exception as e:
                 log(f"Error restoring {file_path}: {e}", "ERROR")
+                project_success = False
         
-        log(f"Rollback completed for {p_name}", "INFO")
+        if project_success:
+            success_count += 1
+            log(f"Rollback completed successfully for {p_name}", "INFO")
+        else:
+            fail_count += 1
+            log(f"Rollback completed with errors for {p_name}", "WARN")
     
     log("\n" + "=" * 70, "INFO")
-    log("ROLLBACK COMPLETE", "INFO")
+    log(f"ROLLBACK COMPLETE: {success_count} successful, {fail_count} with errors", "INFO")
     log("=" * 70, "INFO")
+    
+    return success_count > 0
 
 
 def log(msg, level="INFO"):
@@ -410,6 +423,11 @@ def wait_for_pipeline_completion(pid, pipeline_id, timeout=1800, check_interval=
     last_status = None
     
     while True:
+        # Check for interruption
+        if INTERRUPTED:
+            log("Pipeline wait interrupted by user", "WARN")
+            return {"status": "interrupted", "pipeline": None}
+        
         elapsed = time.time() - start_time
         if elapsed > timeout:
             log(f"Pipeline {pipeline_id} timed out after {int(elapsed)}s", "ERROR")
@@ -465,15 +483,11 @@ def find_job_by_name(jobs, job_name):
     return None
 
 
-def trigger_manual_job(pid, job_id, dry_run=False):
+def trigger_manual_job(pid, job_id):
     """
     Trigger a manual job (play button).
     Returns the job response.
     """
-    if dry_run:
-        log(f"(dry-run) Would trigger job {job_id}", "DRY")
-        return {"status": "success"}
-    
     try:
         response = api_call(f"projects/{pid}/jobs/{job_id}/play", method="POST")
         return response
@@ -501,6 +515,11 @@ def wait_for_job_completion(pid, job_id, timeout=900, check_interval=15):
     last_status = None
     
     while True:
+        # Check for interruption
+        if INTERRUPTED:
+            log("Job wait interrupted by user", "WARN")
+            return {"status": "interrupted", "job": None}
+        
         elapsed = time.time() - start_time
         if elapsed > timeout:
             log(f"Job {job_id} timed out after {int(elapsed)}s", "ERROR")
@@ -552,91 +571,6 @@ def map_tag_to_deploy_job(tag_name):
     }
     
     return deploy_jobs.get(tag_lower)
-
-
-def generate_dry_run_summary(summary_data):
-    """
-    Generate and display a comprehensive dry-run summary.
-    
-    Args:
-        summary_data: Dict with dry-run statistics
-    """
-    print("\n" + "=" * 70)
-    print("DRY-RUN SUMMARY")
-    print("=" * 70)
-    
-    # Projects overview
-    total = summary_data.get('total_projects', 0)
-    would_succeed = summary_data.get('would_succeed', 0)
-    warnings = summary_data.get('warnings', 0)
-    would_fail = summary_data.get('would_fail', 0)
-    
-    print(f"\nTotal Projects: {total}")
-    if would_succeed > 0:
-        print(f"  [SUCCESS] Would succeed: {would_succeed}")
-    if warnings > 0:
-        print(f"  [WARNING] Warnings: {warnings}")
-    if would_fail > 0:
-        print(f"  [FAILED] Would fail: {would_fail}")
-    
-    # Changes overview
-    changes = summary_data.get('changes', {})
-    if changes:
-        print(f"\nChanges Overview:")
-        if changes.get('pom_files', 0) > 0:
-            print(f"  POM files: {changes['pom_files']}")
-        if changes.get('ci_files', 0) > 0:
-            print(f"  CI files: {changes['ci_files']}")
-        if changes.get('eb_files', 0) > 0:
-            print(f"  EB files: {changes['eb_files']}")
-    
-    # Actions overview
-    actions = summary_data.get('actions', {})
-    if actions:
-        print(f"\nActions:")
-        if actions.get('commits', 0) > 0:
-            print(f"  Commits: {actions['commits']}")
-        if actions.get('mrs', 0) > 0:
-            print(f"  MRs: {actions['mrs']}")
-        if actions.get('tags', 0) > 0:
-            print(f"  Tags: {actions['tags']}")
-            tag_breakdown = actions.get('tag_breakdown', {})
-            if tag_breakdown:
-                for tag_type, count in tag_breakdown.items():
-                    print(f"    {tag_type}: {count}")
-        if actions.get('deployments', 0) > 0:
-            print(f"  Deployments: {actions['deployments']}")
-    
-    # Time estimate
-    avg_time = summary_data.get('avg_time_per_project', 150)  # seconds
-    total_time_seconds = total * avg_time
-    
-    hours = int(total_time_seconds // 3600)
-    minutes = int((total_time_seconds % 3600) // 60)
-    
-    print(f"\nEstimated Time: ", end="")
-    if hours > 0:
-        print(f"{hours}h ", end="")
-    print(f"{minutes}m")
-    
-    # Issues found
-    issues = summary_data.get('issues', [])
-    if issues:
-        print(f"\n[WARNING] Issues Found:")
-        for issue in issues[:10]:  # Show first 10
-            print(f"  - {issue}")
-        if len(issues) > 10:
-            print(f"  ... and {len(issues) - 10} more")
-    
-    print("\n" + "=" * 70)
-    
-    # Save summary to file
-    os.makedirs(LOG_DIR_DRY_RUN, exist_ok=True)
-    summary_file = os.path.join(LOG_DIR_DRY_RUN, f"dry_run_summary_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
-    with open(summary_file, 'w') as f:
-        json.dump(summary_data, f, indent=2)
-    
-    log(f"Dry-run summary saved to {summary_file}", "INFO")
 
 
 def validate_and_log_token_info(token, base_url):
@@ -777,24 +711,16 @@ def retry(tries=3, delay=1, backoff=2, allowed_exceptions=(Exception,)):
 
 
 @retry(tries=3, delay=1, backoff=2, allowed_exceptions=(Exception,))
-def api_call(endpoint, method="GET", data=None, dry_run=False):
+def api_call(endpoint, method="GET", data=None):
     """
     Wrapper for GitLab API calls.
 
     Behavior:
-      - If dry_run=True and method != "GET", logs and returns sensible empty structures.
       - Raises exceptions on HTTP 429 or any 5xx to allow retry/backoff.
       - For other HTTP errors (4xx except 429) returns a dict with {"error": True, "details": "..."}
       - On success returns parsed JSON or {} when response body empty.
     """
     url = f"{BASE_URL.rstrip('/')}/{endpoint.lstrip('/')}"
-    if dry_run and method != "GET":
-        log(f"(dry-run) Would call: {method} {url} with data: {json.dumps(data) if data else None}", "DRY")
-        if method == "POST":
-            return {}
-        if method == "DELETE":
-            return {}
-        return {}
 
     if not TOKEN:
         raise RuntimeError("API token not set. Provide --token on the command line or set the TOKEN constant in the script.")
@@ -841,22 +767,18 @@ def show_unified_diff(path, old, new):
     return ud
 
 
-def prompt_yes_no(prompt, default=False, non_interactive=False):
-    if non_interactive:
-        # In non-interactive mode, always return default
-        log(f"{prompt} [auto: {'yes' if default else 'no'}]", "INFO")
-        return default
-    
+def prompt_yes_no(prompt, default=False):
     try:
         ans = input(f"{prompt} [{'Y/n' if default else 'y/N'}]: ").strip().lower()
-    except EOFError:
+    except (EOFError, KeyboardInterrupt):
+        log("\n[INTERRUPT] User interrupted prompt", "WARN")
         return default
     if ans == '':
         return default
     return ans in ("y", "yes")
 
 
-def create_feature_branch(pid, p_name, dry_run=False):
+def create_feature_branch(pid, p_name):
     """
     Create feature branch from source branch.
     Returns True if successful, False otherwise.
@@ -864,11 +786,7 @@ def create_feature_branch(pid, p_name, dry_run=False):
     try:
         log(f"Creating feature branch '{FEATURE_BRANCH}' from '{SOURCE_BRANCH}' for project {p_name}...", "INFO")
         result = api_call(f"projects/{pid}/repository/branches", "POST", 
-                         {"branch": FEATURE_BRANCH, "ref": SOURCE_BRANCH}, dry_run=dry_run)
-        
-        if dry_run:
-            log(f"(dry-run) Would create branch '{FEATURE_BRANCH}'", "INFO")
-            return True
+                         {"branch": FEATURE_BRANCH, "ref": SOURCE_BRANCH})
         
         if isinstance(result, dict) and not result.get("error"):
             log(f"[SUCCESS] Feature branch '{FEATURE_BRANCH}' created successfully for {p_name}", "INFO")
@@ -1019,7 +937,46 @@ def find_parent_version_in_pom(content):
     return None
 
 
-def detect_conflicts(pid, file_path, base_content, our_content, remote_ref, dry_run=False):
+def check_files_already_match(pid, actions, branch_ref):
+    """
+    Check if all files in actions already match their desired state on the branch.
+    
+    Args:
+        pid: Project ID
+        actions: List of action dicts with file_path and content
+        branch_ref: Branch to check against
+    
+    Returns:
+        tuple: (all_match: bool, details: list of file status)
+    """
+    all_match = True
+    details = []
+    
+    for act in actions:
+        file_path = act['file_path']
+        desired_content = act['content']
+        quoted_path = urllib.parse.quote(file_path, safe='')
+        
+        try:
+            current_res = api_call(f"projects/{pid}/repository/files/{quoted_path}?ref={urllib.parse.quote(branch_ref, safe='')}")
+            if isinstance(current_res, dict) and "content" in current_res:
+                current_content = base64.b64decode(current_res['content']).decode('utf-8')
+                if current_content == desired_content:
+                    details.append({'file': file_path, 'match': True})
+                else:
+                    details.append({'file': file_path, 'match': False, 'reason': 'content differs'})
+                    all_match = False
+            else:
+                details.append({'file': file_path, 'match': False, 'reason': 'file not found or error'})
+                all_match = False
+        except Exception as e:
+            details.append({'file': file_path, 'match': False, 'reason': f'error: {str(e)}'})
+            all_match = False
+    
+    return all_match, details
+
+
+def detect_conflicts(pid, file_path, base_content, our_content, remote_ref):
     """
     Detect if there are conflicts between our changes and remote changes.
     
@@ -1027,11 +984,6 @@ def detect_conflicts(pid, file_path, base_content, our_content, remote_ref, dry_
         - None if no conflict detected
         - dict with conflict info if conflict detected
     """
-    if dry_run:
-        # Skip conflict detection in dry-run mode
-        log(f"(dry-run) Skipping conflict detection for {file_path}", "DRY")
-        return None
-    
     quoted_path = urllib.parse.quote(file_path, safe='')
     remote_res = api_call(f"projects/{pid}/repository/files/{quoted_path}?ref={urllib.parse.quote(remote_ref, safe='')}")
     
@@ -1183,6 +1135,27 @@ def handle_conflict(conflict_info, pid, p_name):
         print(show_unified_diff(file_path, conflict_info['base_content'], conflict_info['remote_content']))
         print(f"{'='*80}\n")
     
+    # Fetch latest commit context for this file
+    try:
+        quoted_file = urllib.parse.quote(file_path, safe='')
+        commits_resp = api_call(f"projects/{pid}/repository/commits?path={quoted_file}&ref_name={urllib.parse.quote(FEATURE_BRANCH, safe='')}&per_page=1")
+        
+        if isinstance(commits_resp, list) and len(commits_resp) > 0:
+            latest_commit = commits_resp[0]
+            commit_sha = latest_commit.get('id', 'unknown')[:8]
+            commit_author = latest_commit.get('author_name', 'unknown')
+            commit_date = latest_commit.get('created_at', 'unknown')
+            commit_msg = latest_commit.get('message', 'unknown').split('\n')[0][:80]
+            
+            print(f"\n--- Latest commit for {file_path} on {FEATURE_BRANCH} ---")
+            print(f"Commit: {commit_sha}")
+            print(f"Author: {commit_author}")
+            print(f"Date: {commit_date}")
+            print(f"Message: {commit_msg}")
+            print(f"{'='*80}\n")
+    except Exception as e:
+        log(f"Could not fetch commit context for {file_path}: {e}", "DEBUG")
+    
     print(f"\nConflict resolution options for {file_path}:")
     print("  1. Use our version (overwrite remote changes)")
     print("  2. Use remote version (discard our changes)")
@@ -1190,7 +1163,12 @@ def handle_conflict(conflict_info, pid, p_name):
     print("  4. Abort entire operation")
     
     while True:
-        choice = input("Choose [1/2/3/4]: ").strip()
+        try:
+            choice = input("Choose [1/2/3/4]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            log("\n[INTERRUPT] User interrupted conflict resolution", "WARN")
+            raise Exception("User interrupted during conflict resolution")
+        
         if choice == '1':
             log(f"Using our version for {file_path}", "INFO")
             return "ours"
@@ -1207,747 +1185,712 @@ def handle_conflict(conflict_info, pid, p_name):
             print("Invalid choice. Please enter 1, 2, 3, or 4.")
 
 
-def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=None, force_tags=False, 
-                   auto_deploy=False, non_interactive=False, state=None, rollback_data=None, 
-                   dry_run_summary=None, skip_file_changes=False, enable_tag_deploy=True):
+def create_mr_for_project(pid, p_name, rollback_data):
+    """
+    Create a merge request for a project.
+    
+    Returns:
+        dict: {'success': bool, 'idempotent': bool, 'url': str or None}
+    """
+    log(f"--- Creating MR for: {p_name} (project id: {pid}) ---", "INFO")
+    
+    # Check for interruption
+    if INTERRUPTED:
+        log("MR creation interrupted", "WARN")
+        return {'success': False, 'idempotent': False, 'url': None}
+    
+    # Check if feature branch exists
+    br_check = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
+    
+    if not (isinstance(br_check, dict) and "name" in br_check):
+        log(f"Feature branch '{FEATURE_BRANCH}' does not exist for {p_name}. Creating it...", "WARN")
+        branch_created = create_feature_branch(pid, p_name)
+        if not branch_created:
+            log(f"[ERROR] Cannot create MR without feature branch for {p_name}", "ERROR")
+            return {'success': False, 'idempotent': False, 'url': None}
+        br_check = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
+    
+    # Check if MR already exists (IDEMPOTENCY CHECK)
+    log(f"Checking if MR already exists for {FEATURE_BRANCH}...", "INFO")
+    try:
+        existing = api_call(f"projects/{pid}/merge_requests?state=opened&source_branch={urllib.parse.quote(FEATURE_BRANCH, safe='')}")
+    except Exception as e:
+        existing = {"error": True, "details": str(e)}
+
+    has_open_mr = isinstance(existing, list) and len(existing) > 0
+    if isinstance(existing, dict) and existing.get("error"):
+        log(f"Could not verify existing MRs for {p_name}: {existing.get('details')}", "ERROR")
+        return {'success': False, 'idempotent': False, 'url': None}
+
+    if has_open_mr:
+        try:
+            existing_url = existing[0].get('web_url', 'unknown')
+            log(f"[IDEMPOTENT] MR already exists: {existing_url}", "INFO")
+            return {'success': True, 'idempotent': True, 'url': existing_url}
+        except Exception:
+            log("[IDEMPOTENT] MR already exists (could not parse response).", "INFO")
+            return {'success': True, 'idempotent': True, 'url': None}
+    
+    # Create MR
+    log(f"Creating new MR for {p_name}...", "INFO")
+    mr_payload = {"source_branch": FEATURE_BRANCH, "target_branch": SOURCE_BRANCH, "title": MR_TITLE}
+    mr_result = api_call(f"projects/{pid}/merge_requests", "POST", mr_payload)
+    
+    if isinstance(mr_result, dict) and not mr_result.get("error"):
+        mr_url = mr_result.get('web_url', 'N/A')
+        log(f"[SUCCESS] MR created: {mr_url}", "INFO")
+        return {'success': True, 'idempotent': False, 'url': mr_url}
+    else:
+        log(f"[ERROR] Failed to create MR: {mr_result.get('details', 'unknown error')}", "ERROR")
+        return {'success': False, 'idempotent': False, 'url': None}
+
+
+def process_project(pid, choices=None, show_full=True, rollback_data=None, mode='full', state=None):
     """
     Process a single project with file changes and/or deployment.
     
     Args:
-        skip_file_changes: If True, skip file modification step (just deploy mode)
-        enable_tag_deploy: If True, allow tag creation and deployment
+        pid: Project ID
+        choices: List of file changes to make (1=POM, 2=CI, 3=EB)
+        show_full: Show full diffs vs summary
+        rollback_data: Dict to store rollback snapshots
+        mode: 'full' (changes+deploy/MR), 'mr_only' (just create MR), 'deploy_only' (just deploy)
+        state: State dict for tracking progress
+    
+    Returns:
+        Dict with status information
     """
+    # Check for interruption at start
+    if INTERRUPTED:
+        log("Processing interrupted before starting project", "WARN")
+        return {'project_id': pid, 'success': False, 'interrupted': True}
+    
     project_start_time = time.time()
     
     project_info = api_call(f"projects/{pid}")
     p_name = project_info.get('name', f"ID:{pid}") if isinstance(project_info, dict) else f"ID:{pid}"
-    log(f"--- Processing: {p_name} (project id: {pid}) ---")
-    actions = []
-
-    committed_shas = set()
-    created_tags = set()
-    deployment_successful = False
+    log(f"--- Processing: {p_name} (project id: {pid}) ---", "INFO")
     
-    # Track for dry-run summary
-    project_summary = {
-        'success': True,
-        'warnings': [],
-        'changes': []
+    result = {
+        'project_id': pid,
+        'project_name': p_name,
+        'success': False,
+        'committed': False,
+        'deployed': False,
+        'mr_created': False,
+        'error': None,
+        'interrupted': False,
+        'idempotent_commit': False,
+        'idempotent_mr': False,
+        'idempotent_tags': []
     }
-
-    br_check = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
-    current_ref = FEATURE_BRANCH if isinstance(br_check, dict) and "name" in br_check else SOURCE_BRANCH
-
-    branch_head_before = None
-    if isinstance(br_check, dict) and "commit" in br_check:
-        branch_head_before = (br_check.get("commit") or {}).get("id")
-
-    # Store original content for conflict detection
-    original_contents = {}
-
-    # WORKFLOW 1: Make file changes (skip if skip_file_changes=True)
-    if not skip_file_changes:
-        # 1. POM
-        if choices and '1' in choices:
-            res = api_call(f"projects/{pid}/repository/files/{urllib.parse.quote('pom.xml', safe='')}?ref={urllib.parse.quote(current_ref, safe='')}")
-            if isinstance(res, dict) and res.get("error"):
-                log(f"Failed to fetch pom.xml for {p_name}: {res.get('details')}", "ERROR")
-            elif "content" in res:
-                orig = base64.b64decode(res['content']).decode('utf-8')
-                original_contents['pom.xml'] = orig
-                upd = re.sub(r"<(java\.version|maven\.compiler\.(source|target|release))>11</\1>", r"<\1>17</\1>", orig)
-                if "<parent>" in upd:
-                    upd = re.sub(r"<parent>[\s\S]*?</parent>", update_parent_block, upd)
-                if orig != upd:
-                    actions.append({"action": "update", "file_path": "pom.xml", "content": upd, "old_content": orig})
-
-        # 2. CI
-        if choices and '2' in choices:
-            res = api_call(f"projects/{pid}/repository/files/{urllib.parse.quote('.gitlab-ci.yml', safe='')}?ref={urllib.parse.quote(current_ref, safe='')}")
-            if isinstance(res, dict) and res.get("error"):
-                log(f"Failed to fetch .gitlab-ci.yml for {p_name}: {res.get('details')}", "ERROR")
-            elif "content" in res:
-                orig = base64.b64decode(res['content']).decode('utf-8')
-                original_contents['.gitlab-ci.yml'] = orig
-                upd = re.sub(r"^\s*image:.*(\n|$)", "", orig, flags=re.MULTILINE)
-                if orig != upd:
-                    actions.append({"action": "update", "file_path": ".gitlab-ci.yml", "content": upd, "old_content": orig})
-
-        # 3. EB
-        if choices and '3' in choices:
-            path = urllib.parse.quote(".elasticbeanstalk/config.yml", safe='')
-            res = api_call(f"projects/{pid}/repository/files/{path}?ref={urllib.parse.quote(current_ref, safe='')}")
-            if isinstance(res, dict) and res.get("error"):
-                log(f"Failed to fetch .elasticbeanstalk/config.yml for {p_name}: {res.get('details')}", "ERROR")
-            elif "content" in res:
-                orig = base64.b64decode(res['content']).decode('utf-8')
-                original_contents['.elasticbeanstalk/config.yml'] = orig
-                upd = re.sub(r"(default_platform:\s*).*$", f"default_platform: {NEW_DEFAULT_PLATFORM}", orig, flags=re.MULTILINE)
-                if orig != upd:
-                    actions.append({"action": "update", "file_path": ".elasticbeanstalk/config.yml", "content": upd, "old_content": orig})
-
-        if actions:
-            print(f"\nProposed changes for {p_name}:")
-            for action in actions:
-                if show_full:
-                    ud = show_unified_diff(action['file_path'], action['old_content'], action['content'])
-                    if ud.strip():
-                        print(f"\n--- Diff for {action['file_path']} ---")
-                        print(ud)
-                        print(f"--- End diff for {action['file_path']} ---\n")
-                    else:
-                        print(f"   {action['file_path']} -> [+0 | -0 lines] (no textual diff)")
+    
+    try:
+        # MODE: MR ONLY
+        if mode == 'mr_only':
+            mr_result = create_mr_for_project(pid, p_name, rollback_data)
+            result['mr_created'] = mr_result['success']
+            result['idempotent_mr'] = mr_result['idempotent']
+            result['success'] = mr_result['success']
+            
+            # Update state
+            if state is not None:
+                if mr_result['success']:
+                    state['completed_projects'].append(pid)
                 else:
-                    diff = list(difflib.ndiff(action['old_content'].splitlines(), action['content'].splitlines()))
-                    added = len([l for l in diff if l.startswith('+ ')])
-                    removed = len([l for l in diff if l.startswith('- ')])
-                    print(f"   {action['file_path']} -> [+{added} | -{removed} lines]")
-                
-                # Track for dry-run summary
-                if dry_run_summary is not None:
-                    project_summary['changes'].append(action['file_path'])
-                    if action['file_path'] == 'pom.xml':
-                        dry_run_summary['changes']['pom_files'] += 1
-                    elif action['file_path'] == '.gitlab-ci.yml':
-                        dry_run_summary['changes']['ci_files'] += 1
-                    elif action['file_path'] == '.elasticbeanstalk/config.yml':
-                        dry_run_summary['changes']['eb_files'] += 1
+                    state['failed_projects'].append(pid)
+                save_state(state)
+            
+            return result
+        
+        # MODE: FULL or DEPLOY_ONLY
+        actions = []
+        br_check = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
+        current_ref = FEATURE_BRANCH if isinstance(br_check, dict) and "name" in br_check else SOURCE_BRANCH
+        
+        # STEP 1: Prepare file changes (skip for deploy_only mode)
+        if mode == 'full' and choices:
+            # Check for interruption
+            if INTERRUPTED:
+                log("Interrupted during file preparation", "WARN")
+                result['interrupted'] = True
+                return result
+            
+            # 1. POM
+            if '1' in choices:
+                res = api_call(f"projects/{pid}/repository/files/{urllib.parse.quote('pom.xml', safe='')}?ref={urllib.parse.quote(current_ref, safe='')}")
+                if isinstance(res, dict) and res.get("error"):
+                    log(f"Failed to fetch pom.xml for {p_name}: {res.get('details')}", "ERROR")
+                elif "content" in res:
+                    orig = base64.b64decode(res['content']).decode('utf-8')
+                    upd = re.sub(r"<(java\.version|maven\.compiler\.(source|target|release))>11</\1>", r"<\1>17</\1>", orig)
+                    if "<parent>" in upd:
+                        upd = re.sub(r"<parent>[\s\S]*?</parent>", update_parent_block, upd)
+                    if orig != upd:
+                        actions.append({"action": "update", "file_path": "pom.xml", "content": upd, "old_content": orig})
 
-            if prompt_yes_no(f"Commit changes for {p_name}?", default=False if not non_interactive else True, non_interactive=non_interactive):
+            # 2. CI
+            if '2' in choices:
+                res = api_call(f"projects/{pid}/repository/files/{urllib.parse.quote('.gitlab-ci.yml', safe='')}?ref={urllib.parse.quote(current_ref, safe='')}")
+                if isinstance(res, dict) and res.get("error"):
+                    log(f"Failed to fetch .gitlab-ci.yml for {p_name}: {res.get('details')}", "ERROR")
+                elif "content" in res:
+                    orig = base64.b64decode(res['content']).decode('utf-8')
+                    upd = re.sub(r"^\s*image:.*(\n|$)", "", orig, flags=re.MULTILINE)
+                    if orig != upd:
+                        actions.append({"action": "update", "file_path": ".gitlab-ci.yml", "content": upd, "old_content": orig})
+
+            # 3. EB
+            if '3' in choices:
+                path = urllib.parse.quote(".elasticbeanstalk/config.yml", safe='')
+                res = api_call(f"projects/{pid}/repository/files/{path}?ref={urllib.parse.quote(current_ref, safe='')}")
+                if isinstance(res, dict) and res.get("error"):
+                    log(f"Failed to fetch .elasticbeanstalk/config.yml for {p_name}: {res.get('details')}", "ERROR")
+                elif "content" in res:
+                    orig = base64.b64decode(res['content']).decode('utf-8')
+                    upd = re.sub(r"(default_platform:\s*).*$", f"default_platform: {NEW_DEFAULT_PLATFORM}", orig, flags=re.MULTILINE)
+                    if orig != upd:
+                        actions.append({"action": "update", "file_path": ".elasticbeanstalk/config.yml", "content": upd, "old_content": orig})
+
+            # Show preview of changes
+            if actions:
+                print(f"\n{'='*70}")
+                print(f"PREVIEW: Proposed changes for {p_name}")
+                print(f"{'='*70}")
+                for action in actions:
+                    if show_full:
+                        ud = show_unified_diff(action['file_path'], action['old_content'], action['content'])
+                        if ud.strip():
+                            print(f"\n--- Diff for {action['file_path']} ---")
+                            print(ud)
+                            print(f"--- End diff for {action['file_path']} ---\n")
+                        else:
+                            print(f"   {action['file_path']} -> [+0 | -0 lines] (no textual diff)")
+                    else:
+                        diff = list(difflib.ndiff(action['old_content'].splitlines(), action['content'].splitlines()))
+                        added = len([l for l in diff if l.startswith('+ ')])
+                        removed = len([l for l in diff if l.startswith('- ')])
+                        print(f"   {action['file_path']} -> [+{added} | -{removed} lines]")
+                print(f"{'='*70}\n")
+                
+                # Ask to commit
+                if not prompt_yes_no(f"Commit these changes for {p_name}?", default=True):
+                    log(f"User skipped commit for {p_name}", "INFO")
+                    if state is not None:
+                        state['skipped_projects'].append(pid)
+                        save_state(state)
+                    return result
+                
+                # Check for interruption before committing
+                if INTERRUPTED:
+                    log("Interrupted before commit", "WARN")
+                    result['interrupted'] = True
+                    return result
+                
                 # Create rollback snapshot before making changes
-                if not dry_run and rollback_data is not None:
+                if rollback_data is not None:
                     files_to_backup = [action['file_path'] for action in actions]
                     snapshot = create_rollback_snapshot(pid, p_name, current_ref, files_to_backup)
                     rollback_data['snapshots'].append(snapshot)
                     log(f"Created rollback snapshot for {p_name}", "DEBUG")
                 
-                if dry_run_summary is not None:
-                    dry_run_summary['actions']['commits'] += 1
-                
-                # Create feature branch if it doesn't exist
+                # Create feature branch if needed
                 if not (isinstance(br_check, dict) and "name" in br_check):
-                    branch_created = create_feature_branch(pid, p_name, dry_run=dry_run)
-                    if not branch_created and not dry_run:
+                    branch_created = create_feature_branch(pid, p_name)
+                    if not branch_created:
                         log(f"[ERROR] Cannot proceed without feature branch for {p_name}", "ERROR")
-                        return
-                    
-                    br_check = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
-                    current_ref = FEATURE_BRANCH if isinstance(br_check, dict) and "name" in br_check else SOURCE_BRANCH
-                    if isinstance(br_check, dict) and "commit" in br_check:
-                        branch_head_before = (br_check.get("commit") or {}).get("id")
-
-                # Conflict detection (skip in dry-run)
-                if not dry_run:
-                    log(f"Checking for conflicts on {FEATURE_BRANCH}...", "INFO")
-                    conflicts_detected = []
-                    
-                    for act in actions:
-                        file_path = act['file_path']
-                        base_content = act['old_content']
-                        our_content = act['content']
+                        result['error'] = "Failed to create feature branch"
                         
-                        conflict = detect_conflicts(pid, file_path, base_content, our_content, FEATURE_BRANCH, dry_run=dry_run)
-                        if conflict:
-                            conflicts_detected.append((act, conflict))
-                    
-                    if conflicts_detected:
-                        log(f"Found {len(conflicts_detected)} file(s) with potential conflicts.", "WARN")
+                        if state is not None:
+                            state['failed_projects'].append(pid)
+                            save_state(state)
                         
-                        # Handle each conflict
-                        for act, conflict in conflicts_detected:
-                            try:
-                                resolution = handle_conflict(conflict, pid, p_name)
-                                
-                                if resolution == "skip":
-                                    actions = [a for a in actions if a['file_path'] != act['file_path']]
-                                elif resolution == "ours":
-                                    pass
-                                elif resolution == "theirs":
-                                    actions = [a for a in actions if a['file_path'] != act['file_path']]
-                                elif isinstance(resolution, str) and resolution not in ["skip", "ours", "theirs"]:
-                                    for a in actions:
-                                        if a['file_path'] == act['file_path']:
-                                            a['content'] = resolution
-                                            break
-                            except Exception as e:
-                                log(f"Conflict handling aborted: {e}", "ERROR")
-                                return
-                    else:
-                        log("No conflicts detected.", "INFO")
+                        return result
+                
+                # Conflict detection
+                log(f"Checking for conflicts on {FEATURE_BRANCH}...", "INFO")
+                conflicts_detected = []
+                
+                for act in actions:
+                    file_path = act['file_path']
+                    base_content = act['old_content']
+                    our_content = act['content']
+                    
+                    conflict = detect_conflicts(pid, file_path, base_content, our_content, FEATURE_BRANCH)
+                    if conflict:
+                        conflicts_detected.append((act, conflict))
+                
+                if conflicts_detected:
+                    log(f"Found {len(conflicts_detected)} file(s) with potential conflicts.", "WARN")
+                    
+                    # Handle each conflict
+                    for act, conflict in conflicts_detected:
+                        try:
+                            resolution = handle_conflict(conflict, pid, p_name)
+                            
+                            if resolution == "skip":
+                                actions = [a for a in actions if a['file_path'] != act['file_path']]
+                            elif resolution == "ours":
+                                pass
+                            elif resolution == "theirs":
+                                actions = [a for a in actions if a['file_path'] != act['file_path']]
+                            elif isinstance(resolution, str) and resolution not in ["skip", "ours", "theirs"]:
+                                for a in actions:
+                                    if a['file_path'] == act['file_path']:
+                                        a['content'] = resolution
+                                        break
+                        except Exception as e:
+                            log(f"Conflict handling aborted: {e}", "ERROR")
+                            result['error'] = str(e)
+                            
+                            if state is not None:
+                                state['failed_projects'].append(pid)
+                                save_state(state)
+                            
+                            return result
                 else:
-                    log(f"(dry-run) Skipping conflict detection", "DRY")
-                    conflicts_detected = []
-
+                    log("No conflicts detected.", "INFO")
+                
                 if not actions:
                     log(f"No remaining changes to commit for {p_name} after conflict resolution.", "INFO")
                 else:
-                    commit_actions = []
-                    if dry_run:
-                        # In dry-run, just use all actions without checking remote state
-                        commit_actions = [{"action": act["action"], "file_path": act["file_path"], "content": act["content"]} for act in actions]
-                        log(f"(dry-run) Would commit {len(commit_actions)} file(s)", "DRY")
-                    else:
-                        for act in actions:
-                            file_path = act['file_path']
-                            quoted_path = urllib.parse.quote(file_path, safe='')
-                            res = api_call(f"projects/{pid}/repository/files/{quoted_path}?ref={urllib.parse.quote(FEATURE_BRANCH, safe='')}")
-                            desired = act['content']
-                            if isinstance(res, dict) and res.get("error"):
-                                log(f"Error fetching {file_path} on {FEATURE_BRANCH}: {res.get('details')}", "WARN")
-                                commit_actions.append({"action": "create", "file_path": file_path, "content": desired})
-                            elif "content" in res:
-                                remote_content = base64.b64decode(res['content']).decode('utf-8')
-                                if remote_content == desired:
-                                    log(f"Skipping {file_path}: remote already matches desired content.", "INFO")
-                                    continue
-                                else:
-                                    if file_path == "pom.xml":
-                                        remote_ver_str = find_parent_version_in_pom(remote_content)
-                                        remote_ver = parse_version(remote_ver_str)
-                                        desired_ver = parse_version(TARGET_PARENT_VERSION)
-                                        if remote_ver and desired_ver and remote_ver > desired_ver:
-                                            log(f"Remote parent version {'.'.join(map(str,remote_ver))} is newer than desired {TARGET_PARENT_VERSION}.", "WARN")
-                                            if not prompt_yes_no("Remote parent version appears newer. Overwrite (downgrade) anyway?", default=False, non_interactive=non_interactive):
-                                                log(f"Skipping update of {file_path} due to newer remote version.", "INFO")
-                                                continue
-                                    commit_actions.append({"action": "update", "file_path": file_path, "content": desired})
-                            else:
-                                log(f"{file_path} not found on {FEATURE_BRANCH} (or fetch error). Will attempt to create it.", "INFO")
-                                commit_actions.append({"action": "create", "file_path": file_path, "content": desired})
-
-                    if not commit_actions:
-                        log(f"No remaining changes to commit for {p_name}; skipping commit.", "INFO")
-                    else:
-                        if not dry_run and branch_head_before:
-                            br_now = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
-                            branch_head_now = (br_now.get("commit") or {}).get("id") if isinstance(br_now, dict) else None
-                            if branch_head_now and branch_head_now != branch_head_before:
-                                log(f"Branch {FEATURE_BRANCH} head changed from {branch_head_before[:8]} to {branch_head_now[:8]} while running. Aborting commit to avoid overwriting remote changes.", "WARN")
-                                if prompt_yes_no("Branch changed — re-evaluate changes and continue anyway?", default=False, non_interactive=non_interactive):
-                                    branch_head_before = branch_head_now
-                                else:
-                                    log("Skipping commit for this project due to branch head change.", "INFO")
-                                    commit_actions = []
-                        if commit_actions:
-                            commit_payload = {"branch": FEATURE_BRANCH, "commit_message": f"fix: {UPGRADE_TYPE}", "actions": commit_actions}
-                            commit_resp = api_call(f"projects/{pid}/repository/commits", "POST", commit_payload, dry_run=dry_run)
-                            if dry_run:
-                                log("(dry-run) Commit would be sent.", "INFO")
-                            else:
-                                if isinstance(commit_resp, dict) and not commit_resp.get("error"):
-                                    sha = commit_resp.get("id") or (commit_resp.get("commit") or {}).get("id")
-                                    if sha:
-                                        committed_shas.add(sha)
-                                        log(f"Recorded new commit {sha[:8]} for project {p_name}.", "INFO")
-                                elif isinstance(commit_resp, list):
-                                    for item in commit_resp:
-                                        if isinstance(item, dict):
-                                            sha = item.get("id") or (item.get("commit") or {}).get("id")
-                                            if sha:
-                                                committed_shas.add(sha)
-                                else:
-                                    log(f"Commit response: {commit_resp}", "DEBUG")
-                                log("Commit request sent." if not dry_run else "(dry-run) Commit would be sent.", "INFO")
-        else:
-            log(f"No proposed changes for {p_name}.", "INFO")
-    else:
-        log(f"[INFO] Skipping file changes for {p_name} (deploy-only mode)", "INFO")
-
-    # WORKFLOW 2: Tag and deployment orchestration (only if enabled)
-    if enable_tag_deploy:
-        do_orch = prompt_yes_no("Trigger tags/deployment? (y/n)", default=False if not skip_file_changes else True, non_interactive=non_interactive)
-        if do_orch:
-            tags_resp = fetch_all_tags_for_project(pid)
-            if isinstance(tags_resp, dict) and tags_resp.get("error"):
-                log(f"Could not fetch tags for project {p_name}: {tags_resp.get('details')}", "ERROR")
-                return
-
-            available_tags_all = tags_resp if isinstance(tags_resp, list) else []
-            
-            # Filter and sort deployment tags
-            filter_result = filter_and_sort_deployment_tags(available_tags_all)
-            
-            if isinstance(filter_result, dict) and filter_result.get("error"):
-                log(f"Error filtering tags: {filter_result.get('details')}", "ERROR")
-                return
-            
-            available_tags = filter_result['sorted_tags']
-            found_categories = filter_result['found_categories']
-            missing_categories = filter_result['missing_categories']
-            
-            # Log what was found
-            log(f"Deployment tags found for {p_name}:", "INFO")
-            if found_categories:
-                for category, tag_names in found_categories.items():
-                    log(f"  {category.upper()}: {', '.join(tag_names)}", "INFO")
-            
-            # Log missing tags
-            if missing_categories:
-                for category in missing_categories:
-                    log(f"  {category.upper()}: NOT FOUND", "WARN")
-            
-            # Check if both dev and test are missing
-            dev_missing = 'dev' in missing_categories
-            test_missing = 'test' in missing_categories
-            
-            if dev_missing and test_missing:
-                log(f"No dev or test tags present for project {p_name}.", "ERROR")
-                if not prompt_yes_no("Do you want to create new deployment tags on the feature branch?", default=False, non_interactive=non_interactive):
-                    return
-                
-                # Ask which tags to create
-                print("\nWhich tags would you like to create?")
-                print("  1. dev (or azure-dev)")
-                print("  2. test (or azure-test)")
-                print("  3. Both dev and test")
-                print("  4. Custom tag name")
-                
-                choice = input("Enter choice [1/2/3/4]: ").strip()
-                tags_to_create = []
-                
-                # Detect naming convention from existing tags
-                has_azure_prefix = any('azure-' in t.get('name', '').lower() for t in available_tags_all if isinstance(t, dict))
-                
-                if choice == '1':
-                    tags_to_create = ['azure-dev' if has_azure_prefix else 'dev']
-                elif choice == '2':
-                    tags_to_create = ['azure-test' if has_azure_prefix else 'test']
-                elif choice == '3':
-                    if has_azure_prefix:
-                        tags_to_create = ['azure-dev', 'azure-test']
-                    else:
-                        tags_to_create = ['dev', 'test']
-                elif choice == '4':
-                    custom_tag = input("Enter custom tag name: ").strip()
-                    if custom_tag:
-                        tags_to_create = [custom_tag]
-                
-                if tags_to_create:
-                    for tag_name in tags_to_create:
-                        t_res = api_call(f"projects/{pid}/repository/tags", "POST", 
-                                       {"tag_name": tag_name, "ref": FEATURE_BRANCH}, dry_run=dry_run)
-                        if dry_run:
-                            log(f"(dry-run) Would create tag '{tag_name}' on {FEATURE_BRANCH}", "DRY")
-                        else:
-                            if not isinstance(t_res, dict) or not t_res.get("error"):
-                                created_tags.add(tag_name)
-                                created_tag_commit = (t_res.get('commit') or {}).get('id') if isinstance(t_res, dict) else None
-                                if created_tag_commit:
-                                    committed_shas.add(created_tag_commit)
-                                log(f"Created tag '{tag_name}' on {FEATURE_BRANCH}", "INFO")
-                            else:
-                                log(f"Failed to create tag '{tag_name}': {t_res.get('details')}", "ERROR")
-                return
-            
-            # If only dev is missing, suggest creating it
-            if dev_missing and not test_missing:
-                log(f"Dev tag is missing for project {p_name}.", "WARN")
-                test_tag_names = found_categories.get('test', [])
-                if test_tag_names:
-                    has_azure_prefix = any('azure-' in name for name in test_tag_names)
-                    suggested_tag = 'azure-dev' if has_azure_prefix else 'dev'
+                    # IDEMPOTENCY CHECK: Verify if files already match desired state
+                    log(f"Checking if changes already exist on {FEATURE_BRANCH}...", "INFO")
+                    files_already_match, match_details = check_files_already_match(pid, actions, FEATURE_BRANCH)
                     
-                    if prompt_yes_no(f"Test tag exists but dev tag is missing. Create '{suggested_tag}' tag?", default=False, non_interactive=non_interactive):
-                        t_res = api_call(f"projects/{pid}/repository/tags", "POST", 
-                                       {"tag_name": suggested_tag, "ref": FEATURE_BRANCH}, dry_run=dry_run)
-                        if dry_run:
-                            log(f"(dry-run) Would create tag '{suggested_tag}' on {FEATURE_BRANCH}", "DRY")
-                        else:
-                            if not isinstance(t_res, dict) or not t_res.get("error"):
-                                created_tags.add(suggested_tag)
-                                created_tag_commit = (t_res.get('commit') or {}).get('id') if isinstance(t_res, dict) else None
-                                if created_tag_commit:
-                                    committed_shas.add(created_tag_commit)
-                                log(f"Created tag '{suggested_tag}' on {FEATURE_BRANCH}", "INFO")
-                                available_tags.insert(0, {'name': suggested_tag, 'commit': {'id': created_tag_commit}})
-                            else:
-                                log(f"Failed to create tag '{suggested_tag}': {t_res.get('details')}", "ERROR")
-                                return
-            
-            # If only test is missing, suggest creating it
-            if test_missing and not dev_missing:
-                log(f"Test tag is missing for project {p_name}.", "WARN")
-                dev_tag_names = found_categories.get('dev', [])
-                if dev_tag_names:
-                    has_azure_prefix = any('azure-' in name for name in dev_tag_names)
-                    suggested_tag = 'azure-test' if has_azure_prefix else 'test'
-                    
-                    if prompt_yes_no(f"Dev tag exists but test tag is missing. Create '{suggested_tag}' tag?", default=False, non_interactive=non_interactive):
-                        t_res = api_call(f"projects/{pid}/repository/tags", "POST", 
-                                       {"tag_name": suggested_tag, "ref": FEATURE_BRANCH}, dry_run=dry_run)
-                        if dry_run:
-                            log(f"(dry-run) Would create tag '{suggested_tag}' on {FEATURE_BRANCH}", "DRY")
-                        else:
-                            if not isinstance(t_res, dict) or not t_res.get("error"):
-                                created_tags.add(suggested_tag)
-                                created_tag_commit = (t_res.get('commit') or {}).get('id') if isinstance(t_res, dict) else None
-                                if created_tag_commit:
-                                    committed_shas.add(created_tag_commit)
-                                log(f"Created tag '{suggested_tag}' on {FEATURE_BRANCH}", "INFO")
-                                available_tags.append({'name': suggested_tag, 'commit': {'id': created_tag_commit}})
-                            else:
-                                log(f"Failed to create tag '{suggested_tag}': {t_res.get('details')}", "ERROR")
-                                return
-            
-            if not available_tags:
-                log(f"No deployment tags (dev/test/performance) found for project {p_name}.", "WARN")
-                if not prompt_yes_no("Do you want to create a new tag on the feature branch anyway?", default=False, non_interactive=non_interactive):
-                    return
-                new_tag_name = input("Enter tag name to create on feature branch: ").strip()
-                if new_tag_name:
-                    t_res = api_call(f"projects/{pid}/repository/tags", "POST", {"tag_name": new_tag_name, "ref": FEATURE_BRANCH}, dry_run=dry_run)
-                    if dry_run:
-                        log(f"(dry-run) Would create tag '{new_tag_name}' on {FEATURE_BRANCH}", "DRY")
+                    if files_already_match:
+                        log(f"[IDEMPOTENT] All files already match desired state on {FEATURE_BRANCH}. Skipping commit.", "INFO")
+                        for detail in match_details:
+                            if detail['match']:
+                                log(f"  ✓ {detail['file']} already matches", "DEBUG")
+                        result['committed'] = True  # Mark as "committed" since state is correct
+                        result['idempotent_commit'] = True
+                        
+                        # Track idempotency
+                        if state is not None:
+                            state.setdefault('idempotency_stats', {}).setdefault('idempotent_commits', 0)
+                            state['idempotency_stats']['idempotent_commits'] += 1
                     else:
-                        if not isinstance(t_res, dict) or not t_res.get("error"):
-                            created_tags.add(new_tag_name)
-                            created_tag_commit = (t_res.get('commit') or {}).get('id') if isinstance(t_res, dict) else None
-                            if created_tag_commit:
-                                committed_shas.add(created_tag_commit)
-                            log(f"Created tag '{new_tag_name}' on {FEATURE_BRANCH}", "INFO")
+                        log(f"Files need updating on {FEATURE_BRANCH}:", "INFO")
+                        for detail in match_details:
+                            if not detail['match']:
+                                log(f"  ✗ {detail['file']}: {detail.get('reason', 'needs update')}", "DEBUG")
+                        
+                        # Commit changes
+                        commit_payload = {
+                            "branch": FEATURE_BRANCH,
+                            "commit_message": f"fix: {UPGRADE_TYPE}",
+                            "actions": [{"action": act["action"], "file_path": act["file_path"], "content": act["content"]} for act in actions]
+                        }
+                        commit_resp = api_call(f"projects/{pid}/repository/commits", "POST", commit_payload)
+                        
+                        if isinstance(commit_resp, dict) and not commit_resp.get("error"):
+                            log(f"[SUCCESS] Changes committed for {p_name}", "INFO")
+                            result['committed'] = True
                         else:
-                            log(f"Failed to create tag '{new_tag_name}': {t_res.get('details')}", "ERROR")
-                return
-
-            print(f"\nAvailable deployment tags for {p_name} (sorted by deployment order):")
-            for i, t in enumerate(available_tags):
-                commit_id = (t.get('commit') or {}).get('id', '') if isinstance(t, dict) else ''
-                protected_marker = " [PROTECTED]" if t.get('protected') else ""
-                print(f"  {i+1:>3}. {t.get('name', '')}{protected_marker}  {commit_id[:8] if commit_id else ''}")
-
-            sel = input("Select tags to delete & recreate by index or name (e.g. '1,3' or 'dev,test') or 'all' or leave empty to skip: ").strip()
-            selected_tag_names = parse_tag_selection_input(sel, available_tags)
-            if not selected_tag_names:
-                log("No tags selected; skipping tag orchestration for this project.", "INFO")
+                            log(f"[ERROR] Failed to commit changes: {commit_resp.get('details', 'unknown')}", "ERROR")
+                            result['error'] = "Commit failed"
+                            
+                            # Auto-rollback on failure
+                            if AUTO_ROLLBACK_ON_FAILURE and rollback_data and rollback_data.get('snapshots'):
+                                log(f"[AUTO-ROLLBACK] Rolling back changes for {p_name}...", "WARN")
+                                rollback_file = save_rollback_data(rollback_data)
+                                perform_rollback(rollback_file)
+                            
+                            if state is not None:
+                                state['failed_projects'].append(pid)
+                                save_state(state)
+                            
+                            return result
             else:
-                print(f"Selected tags: {', '.join(selected_tag_names)}")
-                
-                # Check if any selected tags are protected
-                protected_tags = []
-                for tag_name in selected_tag_names:
-                    tag_obj = next((t for t in available_tags_all if isinstance(t, dict) and t.get('name') == tag_name), None)
-                    if tag_obj and tag_obj.get('protected'):
-                        protected_tags.append(tag_name)
-                
-                if protected_tags:
-                    log(f"WARNING: The following tags are PROTECTED and cannot be deleted: {', '.join(protected_tags)}", "ERROR")
-                    log("Protected tags will be skipped during tag orchestration.", "WARN")
-                    if not prompt_yes_no("Continue with non-protected tags only?", default=False, non_interactive=non_interactive):
-                        log("Tag orchestration cancelled by user.", "INFO")
-                        return
-                    selected_tag_names = [t for t in selected_tag_names if t not in protected_tags]
-                    if not selected_tag_names:
-                        log("No non-protected tags remaining; skipping tag orchestration.", "INFO")
-                        return
-                
-                if not prompt_yes_no("Proceed with deleting (if present) and recreating these tags on the feature branch?", default=False, non_interactive=non_interactive):
-                    log("Tag orchestration cancelled by user.", "INFO")
-                else:
-                    branch_info_for_tag = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
-                    feature_head = None
-                    if isinstance(branch_info_for_tag, dict) and not branch_info_for_tag.get("error"):
-                        feature_head = (branch_info_for_tag.get("commit") or {}).get("id")
-
-                    for tag in selected_tag_names:
-                        quoted_tag = urllib.parse.quote(tag, safe='')
-                        tag_obj = next((t for t in available_tags_all if isinstance(t, dict) and t.get('name') == tag), None)
-                        tag_commit_id = (tag_obj.get('commit') or {}).get('id') if tag_obj else None
-
-                        if tag_commit_id and tag_commit_id in committed_shas:
-                            log(f"Skipping tag '{tag}': it already points to a commit created in this run ({tag_commit_id[:8]}).", "INFO")
-                            continue
-                        if tag in created_tags:
-                            log(f"Skipping tag '{tag}': it was created earlier in this run.", "INFO")
-                            continue
-                        
-                        # Only skip if tag points to feature head AND force_tags is False
-                        if not force_tags and tag_commit_id and feature_head and tag_commit_id == feature_head:
-                            log(f"Skipping tag '{tag}': already points to feature branch head {feature_head[:8]}. Use --force-tags to recreate anyway.", "INFO")
-                            continue
-                        
-                        if force_tags and tag_commit_id and feature_head and tag_commit_id == feature_head:
-                            log(f"Force recreating tag '{tag}' (already at feature branch head {feature_head[:8]})", "INFO")
-
-                        exists_locally = tag_obj is not None
-                        if exists_locally:
-                            if tag_obj.get('protected'):
-                                log(f"Skipping PROTECTED tag '{tag}' - cannot delete.", "ERROR")
-                                continue
-                            log(f"Tag '{tag}' exists and will be deleted.", "INFO")
-                            api_call(f"projects/{pid}/repository/tags/{quoted_tag}", method="DELETE", dry_run=dry_run)
-
-                        t_res = api_call(f"projects/{pid}/repository/tags", "POST", {"tag_name": tag, "ref": FEATURE_BRANCH}, dry_run=dry_run)
-                        if dry_run:
-                            log(f"(dry-run) Would create tag '{tag}' on {FEATURE_BRANCH}", "DRY")
-                        else:
-                            if not isinstance(t_res, dict) or not t_res.get("error"):
-                                log(f"Created tag '{tag}' on {FEATURE_BRANCH}", "INFO")
-                                created_tags.add(tag)
-                                created_tag_commit = (t_res.get('commit') or {}).get('id') if isinstance(t_res, dict) else None
-                                if created_tag_commit:
-                                    committed_shas.add(created_tag_commit)
-                                    
-                                    # Ask if user wants full deployment orchestration (or use --auto-deploy flag)
-                                    should_deploy = auto_deploy or prompt_yes_no(f"Tag '{tag}' created. Do you want to wait for build and auto-deploy?", default=True, non_interactive=non_interactive)
-                                    
-                                    if should_deploy:
-                                        log(f"Starting deployment orchestration for tag '{tag}'...", "INFO")
-                                        
-                                        # Wait a few seconds for pipeline to be created
-                                        log("Waiting 10 seconds for pipeline to be triggered...", "INFO")
-                                        time.sleep(10)
-                                        
-                                        # Get the pipeline for this commit
-                                        pipeline = get_pipeline_for_commit(pid, created_tag_commit)
-                                        if not pipeline:
-                                            log(f"No pipeline found for commit {created_tag_commit[:8]}. Skipping orchestration.", "WARN")
-                                            continue
-                                        
-                                        pipeline_id = pipeline.get('id')
-                                        pipeline_url = pipeline.get('web_url', 'N/A')
-                                        log(f"Found pipeline {pipeline_id}: {pipeline_url}", "INFO")
-                                        
-                                        # Wait for build to complete
-                                        result = wait_for_pipeline_completion(pid, pipeline_id, timeout=1800, check_interval=30)
-                                        
-                                        if result['status'] != 'success':
-                                            log(f"Build {result['status']} for tag '{tag}'. Stopping orchestration.", "ERROR")
-                                            continue
-                                        
-                                        log(f"Build succeeded for tag '{tag}'! Proceeding to deployment...", "INFO")
-                                        
-                                        # Get all jobs from the pipeline
-                                        jobs = get_pipeline_jobs(pid, pipeline_id)
-                                        if not jobs:
-                                            log(f"No jobs found in pipeline {pipeline_id}. Skipping deployment.", "WARN")
-                                            continue
-                                        
-                                        # Step 1: Trigger eb-terminate job
-                                        terminate_job = find_job_by_name(jobs, 'eb-terminate')
-                                        if terminate_job:
-                                            terminate_job_id = terminate_job.get('id')
-                                            terminate_status = terminate_job.get('status')
-                                            
-                                            log(f"Found 'eb-terminate' job (ID: {terminate_job_id}, status: {terminate_status})", "INFO")
-                                            
-                                            if terminate_status == 'manual':
-                                                log("Triggering 'eb-terminate' job...", "INFO")
-                                                trigger_result = trigger_manual_job(pid, terminate_job_id, dry_run=dry_run)
-                                                
-                                                if not dry_run and (not isinstance(trigger_result, dict) or not trigger_result.get('error')):
-                                                    # Wait for terminate job to complete
-                                                    terminate_result = wait_for_job_completion(pid, terminate_job_id, timeout=900)
-                                                    
-                                                    if terminate_result['status'] != 'success':
-                                                        log(f"eb-terminate job {terminate_result['status']}. Stopping deployment.", "ERROR")
-                                                        continue
-                                                    
-                                                    log("eb-terminate job completed successfully!", "INFO")
-                                                elif dry_run:
-                                                    log("(dry-run) Would wait for eb-terminate to complete", "DRY")
-                                            else:
-                                                log(f"eb-terminate job is not manual (status: {terminate_status}). Skipping trigger.", "WARN")
-                                        else:
-                                            log("'eb-terminate' job not found in pipeline. Skipping termination step.", "WARN")
-                                        
-                                        # Step 2: Trigger deployment job based on tag name
-                                        deploy_job_name = map_tag_to_deploy_job(tag)
-                                        if not deploy_job_name:
-                                            log(f"No deployment job mapping found for tag '{tag}'. Skipping deploy.", "WARN")
-                                            continue
-                                        
-                                        # Refresh jobs list to get updated statuses
-                                        jobs = get_pipeline_jobs(pid, pipeline_id)
-                                        deploy_job = find_job_by_name(jobs, deploy_job_name)
-                                        
-                                        if deploy_job:
-                                            deploy_job_id = deploy_job.get('id')
-                                            deploy_status = deploy_job.get('status')
-                                            
-                                            log(f"Found '{deploy_job_name}' job (ID: {deploy_job_id}, status: {deploy_status})", "INFO")
-                                            
-                                            if deploy_status == 'manual':
-                                                log(f"Triggering '{deploy_job_name}' job...", "INFO")
-                                                trigger_result = trigger_manual_job(pid, deploy_job_id, dry_run=dry_run)
-                                                
-                                                if not dry_run and (not isinstance(trigger_result, dict) or not trigger_result.get('error')):
-                                                    # Wait for deploy job to complete
-                                                    deploy_result = wait_for_job_completion(pid, deploy_job_id, timeout=1200)
-                                                    
-                                                    if deploy_result['status'] == 'success':
-                                                        log(f"[SUCCESS] Deployment completed successfully for tag '{tag}'!", "INFO")
-                                                        deployment_successful = True
-                                                    else:
-                                                        log(f"Deployment {deploy_result['status']} for tag '{tag}'.", "ERROR")
-                                                elif dry_run:
-                                                    log(f"(dry-run) Would wait for {deploy_job_name} to complete", "DRY")
-                                            else:
-                                                log(f"{deploy_job_name} job is not manual (status: {deploy_status}). Skipping trigger.", "WARN")
-                                        else:
-                                            log(f"'{deploy_job_name}' job not found in pipeline. Cannot deploy.", "ERROR")
-                                            log(f"Available jobs: {', '.join([j.get('name', 'unknown') for j in jobs])}", "INFO")
-                            else:
-                                log(f"Failed to create tag '{tag}': {t_res.get('details')}", "ERROR")
-    
-    # WORKFLOW 3: Create MR after successful deployment (NEW FLOW)
-    if deployment_successful and not skip_mr:
-        log(f"[SUCCESS] Deployment successful for {p_name}!", "INFO")
+                log(f"No file changes needed for {p_name}", "INFO")
         
-        # Check if MR already exists
-        try:
-            existing = api_call(f"projects/{pid}/merge_requests?state=opened&source_branch={urllib.parse.quote(FEATURE_BRANCH, safe='')}")
-        except Exception as e:
-            existing = {"error": True, "details": str(e)}
-
-        has_open_mr = isinstance(existing, list) and len(existing) > 0
-        if isinstance(existing, dict) and existing.get("error"):
-            log(f"Could not verify existing MRs for {p_name}: {existing.get('details')}", "ERROR")
-
-        if has_open_mr:
+        # Check for interruption before asking next steps
+        if INTERRUPTED:
+            log("Interrupted before next step selection", "WARN")
+            result['interrupted'] = True
+            return result
+        
+        # STEP 2: Ask what to do next (Deploy or Create MR)
+        if mode == 'full' or mode == 'deploy_only':
+            print(f"\n{'='*60}")
+            print(f"What would you like to do next for {p_name}?")
+            print(f"{'='*60}")
+            print("1. Deploy changes (create tags + trigger deployment)")
+            print("2. Create Merge Request")
+            print("3. Skip (do nothing)")
+            
             try:
-                existing_url = existing[0].get('web_url', 'unknown')
-                log(f"MR already exists: {existing_url}", "INFO")
-            except Exception:
-                log("MR already exists (could not parse response).", "INFO")
-        else:
-            # Ensure feature branch exists
-            if not (isinstance(br_check, dict) and "name" in br_check):
-                if prompt_yes_no(f"Feature branch {FEATURE_BRANCH} not found. Create it from {SOURCE_BRANCH} so an MR can be opened?", default=False, non_interactive=non_interactive):
-                    branch_created = create_feature_branch(pid, p_name, dry_run=dry_run)
-                    if not branch_created and not dry_run:
-                        log(f"[ERROR] Cannot create MR without feature branch for {p_name}", "ERROR")
-                    else:
-                        br_check = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
-
-            if isinstance(br_check, dict) and "name" in br_check:
-                if prompt_yes_no(f"Deployment successful! Create merge request for {p_name} from {FEATURE_BRANCH} into {SOURCE_BRANCH}?", default=True, non_interactive=non_interactive):
-                    mr_payload = {"source_branch": FEATURE_BRANCH, "target_branch": SOURCE_BRANCH, "title": MR_TITLE}
-                    mr_result = api_call(f"projects/{pid}/merge_requests", "POST", mr_payload, dry_run=dry_run)
-                    
-                    if not dry_run:
-                        if isinstance(mr_result, dict) and not mr_result.get("error"):
-                            mr_url = mr_result.get('web_url', 'N/A')
-                            log(f"[SUCCESS] MR created: {mr_url}", "INFO")
-                        else:
-                            log(f"[ERROR] Failed to create MR: {mr_result.get('details', 'unknown error')}", "ERROR")
-                    else:
-                        log("(dry-run) MR would be created.", "INFO")
+                choice = input("Choose [1/2/3] (default: 1): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                log("\n[INTERRUPT] User interrupted next step selection", "WARN")
+                result['interrupted'] = True
+                return result
+            
+            if choice == '2':
+                # Create MR
+                mr_result = create_mr_for_project(pid, p_name, rollback_data)
+                result['mr_created'] = mr_result['success']
+                result['idempotent_mr'] = mr_result['idempotent']
+                result['success'] = result['committed'] or mr_result['success']
+                
+                # Track idempotency
+                if state is not None and mr_result['idempotent']:
+                    state.setdefault('idempotency_stats', {}).setdefault('idempotent_mrs', 0)
+                    state['idempotency_stats']['idempotent_mrs'] += 1
+                
+            elif choice == '3':
+                # Skip
+                log(f"Skipping deployment/MR for {p_name}", "INFO")
+                result['success'] = result['committed']
+                
             else:
-                log(f"Skipping MR creation because feature branch {FEATURE_BRANCH} does not exist.", "INFO")
-    elif not deployment_successful and not skip_mr and enable_tag_deploy:
-        log(f"[INFO] Skipping MR creation for {p_name} - deployment was not successful", "INFO")
-    
-    # Log completion time for this project
-    project_end_time = time.time()
-    project_duration = project_end_time - project_start_time
-    minutes = int(project_duration // 60)
-    seconds = int(project_duration % 60)
-    
-    if minutes > 0:
-        log(f"[COMPLETE] Completed {p_name} in {minutes}m {seconds}s", "INFO")
-    else:
-        log(f"[COMPLETE] Completed {p_name} in {seconds}s", "INFO")
-    
-    # Update state tracking
-    if state is not None:
-        if project_summary['success']:
-            state['completed_projects'].append(pid)
-            if dry_run_summary is not None:
-                dry_run_summary['would_succeed'] += 1
+                # Default: Deploy (option 1)
+                deploy_result = handle_deployment(pid, p_name)
+                result['deployed'] = deploy_result['success']
+                result['idempotent_tags'] = deploy_result['idempotent_tags']
+                result['success'] = result['committed'] or deploy_result['success']
+                
+                # Track idempotency
+                if state is not None and deploy_result['idempotent_tags']:
+                    state.setdefault('idempotency_stats', {}).setdefault('idempotent_tags', 0)
+                    state['idempotency_stats']['idempotent_tags'] += len(deploy_result['idempotent_tags'])
+        
+        # Update state
+        if state is not None:
+            if result['success']:
+                state['completed_projects'].append(pid)
+            else:
+                state['failed_projects'].append(pid)
+            save_state(state)
+        
+        # Log completion time
+        project_end_time = time.time()
+        project_duration = project_end_time - project_start_time
+        minutes = int(project_duration // 60)
+        seconds = int(project_duration % 60)
+        
+        if minutes > 0:
+            log(f"[COMPLETE] Completed {p_name} in {minutes}m {seconds}s", "INFO")
         else:
+            log(f"[COMPLETE] Completed {p_name} in {seconds}s", "INFO")
+        
+        # Track timing for summary
+        if 'project_timings' in globals():
+            project_timings.append((p_name, project_duration))
+        
+        return result
+        
+    except Exception as e:
+        log(f"[ERROR] Exception processing {p_name}: {e}", "ERROR")
+        result['error'] = str(e)
+        
+        # Auto-rollback on failure
+        if AUTO_ROLLBACK_ON_FAILURE and rollback_data and rollback_data.get('snapshots'):
+            log(f"[AUTO-ROLLBACK] Rolling back changes for {p_name}...", "WARN")
+            rollback_file = save_rollback_data(rollback_data)
+            perform_rollback(rollback_file)
+        
+        if state is not None:
             state['failed_projects'].append(pid)
-            if dry_run_summary is not None:
-                dry_run_summary['would_fail'] += 1
+            save_state(state)
         
-        # Save state after each project (for resume capability)
-        save_state(state)
+        return result
+
+
+def handle_deployment(pid, p_name):
+    """
+    Handle tag creation and deployment orchestration for a project.
     
-    # Update dry-run summary
-    if dry_run_summary is not None:
-        if project_summary['warnings']:
-            dry_run_summary['warnings'] += 1
-            dry_run_summary['issues'].extend([f"{p_name}: {w}" for w in project_summary['warnings']])
+    Returns:
+        dict: {'success': bool, 'idempotent_tags': list of tag names that were skipped}
+    """
+    log(f"Starting deployment for {p_name}...", "INFO")
+    
+    # Check for interruption
+    if INTERRUPTED:
+        log("Deployment interrupted", "WARN")
+        return {'success': False, 'idempotent_tags': []}
+    
+    # Fetch tags
+    tags_resp = fetch_all_tags_for_project(pid)
+    if isinstance(tags_resp, dict) and tags_resp.get("error"):
+        log(f"Could not fetch tags for project {p_name}: {tags_resp.get('details')}", "ERROR")
+        return {'success': False, 'idempotent_tags': []}
 
-
-def process_in_batches(project_ids, batch_size=3, batch_delay=30, per_project_prompt=False, **kwargs):
-    total = len(project_ids)
-    if total == 0:
-        log("No projects to process.", "INFO")
-        return
-    for start in range(0, total, batch_size):
-        batch = project_ids[start:start + batch_size]
-        log(f"Starting batch {start // batch_size + 1}: projects {batch}", "INFO")
-        for pid in batch:
-            try:
-                # Per-project file selection if enabled
-                if per_project_prompt:
-                    project_info = api_call(f"projects/{pid}")
-                    p_name = project_info.get('name', f"ID:{pid}") if isinstance(project_info, dict) else f"ID:{pid}"
-                    print(f"\n{'='*60}")
-                    print(f"PROJECT: {p_name} (ID: {pid})")
-                    print(f"{'='*60}")
-                    raw_choices = input(f"Select updates for {p_name} (1:POM, 2:CI, 3:EB, 4:ALL, 0:SKIP): ").replace(" ", "")
+    available_tags_all = tags_resp if isinstance(tags_resp, list) else []
+    
+    # Filter and sort deployment tags
+    filter_result = filter_and_sort_deployment_tags(available_tags_all)
+    
+    if isinstance(filter_result, dict) and filter_result.get("error"):
+        log(f"Error filtering tags: {filter_result.get('details')}", "ERROR")
+        return {'success': False, 'idempotent_tags': []}
+    
+    available_tags = filter_result['sorted_tags']
+    found_categories = filter_result['found_categories']
+    missing_categories = filter_result['missing_categories']
+    
+    # Log what was found
+    log(f"Deployment tags found for {p_name}:", "INFO")
+    if found_categories:
+        for category, tag_names in found_categories.items():
+            log(f"  {category.upper()}: {', '.join(tag_names)}", "INFO")
+    
+    if missing_categories:
+        for category in missing_categories:
+            log(f"  {category.upper()}: NOT FOUND", "WARN")
+    
+    if not available_tags:
+        log(f"No deployment tags found for {p_name}. Skipping deployment.", "WARN")
+        return {'success': False, 'idempotent_tags': []}
+    
+    # Show available tags
+    print(f"\nAvailable deployment tags for {p_name}:")
+    for i, t in enumerate(available_tags):
+        commit_id = (t.get('commit') or {}).get('id', '') if isinstance(t, dict) else ''
+        protected_marker = " [PROTECTED]" if t.get('protected') else ""
+        print(f"  {i+1:>3}. {t.get('name', '')}{protected_marker}  {commit_id[:8] if commit_id else ''}")
+    
+    try:
+        sel = input("Select tags to deploy (e.g. '1' or 'dev' or 'all'): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        log("\n[INTERRUPT] User interrupted tag selection", "WARN")
+        return {'success': False, 'idempotent_tags': []}
+    
+    selected_tag_names = parse_tag_selection_input(sel, available_tags)
+    
+    if not selected_tag_names:
+        log("No tags selected; skipping deployment.", "INFO")
+        return {'success': False, 'idempotent_tags': []}
+    
+    # Get feature branch head
+    branch_info = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
+    feature_head = None
+    if isinstance(branch_info, dict) and not branch_info.get("error"):
+        feature_head = (branch_info.get("commit") or {}).get("id")
+    
+    deployment_successful = False
+    idempotent_tags = []
+    
+    # Process each selected tag
+    for tag_name in selected_tag_names:
+        # Check for interruption
+        if INTERRUPTED:
+            log("Deployment interrupted during tag processing", "WARN")
+            break
+        
+        log(f"\nProcessing tag: {tag_name}", "INFO")
+        
+        # Get tag object
+        quoted_tag = urllib.parse.quote(tag_name, safe='')
+        tag_obj = next((t for t in available_tags_all if isinstance(t, dict) and t.get('name') == tag_name), None)
+        
+        if tag_obj and tag_obj.get('protected'):
+            log(f"Skipping PROTECTED tag '{tag_name}'", "ERROR")
+            continue
+        
+        # IDEMPOTENCY CHECK: If tag already points to feature HEAD, skip
+        tag_commit_id = (tag_obj.get('commit') or {}).get('id') if tag_obj else None
+        
+        if tag_commit_id and feature_head and tag_commit_id == feature_head:
+            log(f"[IDEMPOTENT] Tag '{tag_name}' already points to feature branch HEAD ({feature_head[:8]}). Skipping tag recreation.", "INFO")
+            
+            # Track idempotent tag
+            idempotent_tags.append(tag_name)
+            
+            # Still proceed with deployment if tag is already correct
+            log(f"Tag '{tag_name}' is already correct. Proceeding with deployment check...", "INFO")
+            created_tag_commit = tag_commit_id
+            
+        else:
+            # Delete existing tag if it exists and points elsewhere
+            if tag_obj:
+                log(f"Deleting existing tag '{tag_name}' (currently at {tag_commit_id[:8] if tag_commit_id else 'unknown'})...", "INFO")
+                api_call(f"projects/{pid}/repository/tags/{quoted_tag}", method="DELETE")
+            
+            # Create new tag
+            log(f"Creating tag '{tag_name}' on {FEATURE_BRANCH} ({feature_head[:8] if feature_head else 'unknown'})...", "INFO")
+            t_res = api_call(f"projects/{pid}/repository/tags", "POST", {"tag_name": tag_name, "ref": FEATURE_BRANCH})
+            
+            if isinstance(t_res, dict) and not t_res.get("error"):
+                log(f"Created tag '{tag_name}' on {FEATURE_BRANCH}", "INFO")
+                created_tag_commit = (t_res.get('commit') or {}).get('id') if isinstance(t_res, dict) else None
+            else:
+                log(f"Failed to create tag '{tag_name}': {t_res.get('details')}", "ERROR")
+                continue
+        
+        # Proceed with deployment if we have a commit
+        if created_tag_commit:
+                # Wait for pipeline and trigger deployment
+                log("Waiting 10 seconds for pipeline to be triggered...", "INFO")
+                time.sleep(10)
+                
+                # Check for interruption
+                if INTERRUPTED:
+                    log("Deployment interrupted during pipeline wait", "WARN")
+                    break
+                
+                pipeline = get_pipeline_for_commit(pid, created_tag_commit)
+                if not pipeline:
+                    log(f"No pipeline found for commit {created_tag_commit[:8]}", "WARN")
+                    continue
+                
+                pipeline_id = pipeline.get('id')
+                log(f"Found pipeline {pipeline_id}", "INFO")
+                
+                # Wait for build to complete
+                result = wait_for_pipeline_completion(pid, pipeline_id, timeout=1800, check_interval=30)
+                
+                if result['status'] == 'interrupted':
+                    log("Pipeline monitoring interrupted", "WARN")
+                    break
+                
+                if result['status'] != 'success':
+                    log(f"Build {result['status']} for tag '{tag_name}'", "ERROR")
+                    continue
+                
+                log(f"Build succeeded for tag '{tag_name}'!", "INFO")
+                
+                # Get jobs and trigger deployment
+                jobs = get_pipeline_jobs(pid, pipeline_id)
+                
+                # Trigger eb-terminate
+                terminate_job = find_job_by_name(jobs, 'eb-terminate')
+                if terminate_job and terminate_job.get('status') == 'manual':
+                    log("Triggering 'eb-terminate' job...", "INFO")
+                    trigger_manual_job(pid, terminate_job.get('id'))
+                    terminate_result = wait_for_job_completion(pid, terminate_job.get('id'), timeout=900)
                     
-                    if raw_choices == '0' or raw_choices.lower() == 'skip':
-                        log(f"Skipping project {p_name}", "INFO")
+                    if terminate_result['status'] == 'interrupted':
+                        log("Terminate job interrupted", "WARN")
+                        break
+                    
+                    if terminate_result['status'] != 'success':
+                        log(f"eb-terminate job {terminate_result['status']}", "ERROR")
                         continue
+                
+                # Trigger deploy job
+                deploy_job_name = map_tag_to_deploy_job(tag_name)
+                if deploy_job_name:
+                    jobs = get_pipeline_jobs(pid, pipeline_id)
+                    deploy_job = find_job_by_name(jobs, deploy_job_name)
                     
-                    proj_choices = raw_choices.split(',') if raw_choices else []
-                    if '4' in proj_choices:
-                        proj_choices = [c for c in proj_choices if c != '4']
-                        for c in ('3', '2', '1'):
-                            if c not in proj_choices:
-                                proj_choices.insert(0, c)
-                    
-                    # Override the choices in kwargs
-                    kwargs_copy = kwargs.copy()
-                    kwargs_copy['choices'] = proj_choices
-                    process_project(pid, **kwargs_copy)
-                else:
-                    process_project(pid, **kwargs)
-            except Exception as e:
-                log(f"Unexpected error processing project {pid}: {e}", "ERROR")
-        if start + batch_size < total:
-            log(f"Sleeping {batch_delay}s before next batch...", "INFO")
-            time.sleep(batch_delay)
+                    if deploy_job and deploy_job.get('status') == 'manual':
+                        log(f"Triggering '{deploy_job_name}' job...", "INFO")
+                        trigger_manual_job(pid, deploy_job.get('id'))
+                        deploy_result = wait_for_job_completion(pid, deploy_job.get('id'), timeout=1200)
+                        
+                        if deploy_result['status'] == 'interrupted':
+                            log("Deploy job interrupted", "WARN")
+                            break
+                        
+                        if deploy_result['status'] == 'success':
+                            log(f"[SUCCESS] Deployment completed for tag '{tag_name}'!", "INFO")
+                            deployment_successful = True
+                        else:
+                            log(f"Deployment {deploy_result['status']} for tag '{tag_name}'", "ERROR")
+        else:
+            log(f"No commit available for tag '{tag_name}', skipping deployment", "WARN")
+    
+    return {'success': deployment_successful, 'idempotent_tags': idempotent_tags}
+
+
+def bulk_create_mrs(project_ids, rollback_data, state):
+    """
+    Create merge requests for all projects in bulk.
+    
+    Args:
+        project_ids: List of project IDs
+        rollback_data: Dict to store rollback snapshots
+        state: State dict for tracking progress
+    
+    Returns:
+        Dict with success/failure counts
+    """
+    log("=" * 70, "INFO")
+    log("BULK MR CREATION MODE", "INFO")
+    log("=" * 70, "INFO")
+    
+    results = {
+        'total': len(project_ids),
+        'success': 0,
+        'failed': 0,
+        'skipped': 0,
+        'interrupted': 0
+    }
+    
+    for pid in project_ids:
+        # Check for interruption
+        if INTERRUPTED:
+            log("Bulk MR creation interrupted", "WARN")
+            results['interrupted'] += 1
+            break
+        
+        try:
+            result = process_project(pid, mode='mr_only', rollback_data=rollback_data, state=state)
+            
+            if result.get('interrupted'):
+                results['interrupted'] += 1
+                break
+            elif result['mr_created']:
+                results['success'] += 1
+            elif result['error']:
+                results['failed'] += 1
+            else:
+                results['skipped'] += 1
+                
+        except Exception as e:
+            log(f"Error processing project {pid}: {e}", "ERROR")
+            results['failed'] += 1
+    
+    # Summary
+    log("\n" + "=" * 70, "INFO")
+    log("BULK MR CREATION COMPLETE", "INFO")
+    log("=" * 70, "INFO")
+    log(f"Total Projects: {results['total']}", "INFO")
+    log(f"Success: {results['success']}", "INFO")
+    log(f"Failed: {results['failed']}", "INFO")
+    log(f"Skipped: {results['skipped']}", "INFO")
+    if results['interrupted'] > 0:
+        log(f"Interrupted: {results['interrupted']}", "WARN")
+    
+    return results
 
 
 def main():
-    global TOKEN, PROJECT_IDS, BASE_URL
+    global TOKEN, PROJECT_IDS, BASE_URL, INTERRUPTED
+
+    # Setup signal handlers for graceful interruption
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    # Track execution timing
+    script_start_time = time.time()
+    project_timings = []  # List of tuples: (project_name, duration_seconds)
 
     parser = argparse.ArgumentParser(description="Batch Java migration helper for GitLab projects.")
     parser.add_argument("--projects", help="Comma-separated project IDs to process (overrides PROJECT_IDS)", default="")
     parser.add_argument("--full-diff", help="Show full unified diffs (default: True)", action="store_true", default=True)
     parser.add_argument("--summary-only", help="Show only line-count summary (overrides --full-diff)", action="store_true")
-    parser.add_argument("--dry-run", help="Do not perform write operations (branches, commits, MRs, tags)", action="store_true")
-    parser.add_argument("--skip-mr", help="Do not create merge requests (MR creation will be skipped)", action="store_true")
-    parser.add_argument("--force-tags", help="Force tag recreation even if tag already points to feature branch head", action="store_true")
-    parser.add_argument("--auto-deploy", help="Automatically wait for build and trigger deployment jobs after tag creation", action="store_true")
-    parser.add_argument("--non-interactive", help="Non-interactive mode: no prompts, auto-proceed with all actions (implies --auto-deploy)", action="store_true")
     parser.add_argument("--token", help="GitLab private token string (overrides file-based tokens)", default="")
     parser.add_argument("--base-url", help="GitLab API base URL (overrides .env and script constant)", default="")
-    parser.add_argument("--batch-size", help="Number of projects to process in each batch", type=int, default=3)
-    parser.add_argument("--batch-delay", help="Delay in seconds between batches", type=int, default=30)
-    parser.add_argument("--per-project-prompt", help="Ask which files to update for each project individually", action="store_true")
-    
-    # New feature flags
-    parser.add_argument("--resume", help="Resume from a previous state file", default="")
     parser.add_argument("--rollback", help="Rollback changes from a previous migration using rollback file", default="")
-    parser.add_argument("--workflow", help="Choose workflow: 'changes' (make changes + deploy + MR) or 'deploy' (just deploy)", 
-                       choices=['changes', 'deploy'], default=None)
+    parser.add_argument("--mode", help="Execution mode", choices=['full', 'mr_bulk', 'deploy_only'], default=None)
+    parser.add_argument("--resume", help="Resume from a previous state file", default="")
     
     args = parser.parse_args()
 
     # Handle rollback mode
     if args.rollback:
-        perform_rollback(args.rollback, dry_run=args.dry_run)
+        perform_rollback(args.rollback)
         sys.exit(0)
 
     # Setup file logging
     log_file = setup_file_logging(LOG_DIR_MIGRATION)
     log(f"Logging to file: {log_file}", "INFO")
     
-    # Initialize state and rollback tracking
+    # Initialize state tracking
     state = {
         'completed_projects': [],
         'failed_projects': [],
@@ -1955,41 +1898,22 @@ def main():
         'start_time': datetime.datetime.now().isoformat()
     }
     
-    rollback_data = {
-        'snapshots': []
-    }
-    
     # Resume from previous state if requested
-    resume_from_project = None
     if args.resume:
         loaded_state = load_state(args.resume)
         if loaded_state:
             state = loaded_state
-            completed = state.get('completed_projects', [])
-            if completed:
-                resume_from_project = completed[-1]
-                log(f"Resuming from last completed project: {resume_from_project}", "INFO")
+            log(f"Resumed from previous state: {args.resume}", "INFO")
+            log(f"Completed: {len(state.get('completed_projects', []))} projects", "INFO")
+            log(f"Failed: {len(state.get('failed_projects', []))} projects", "INFO")
         else:
             log(f"Could not load state from {args.resume}, starting fresh", "WARN")
     
-    # Dry-run summary tracking
-    dry_run_summary = {
-        'total_projects': 0,
-        'would_succeed': 0,
-        'warnings': 0,
-        'would_fail': 0,
-        'changes': {'pom_files': 0, 'ci_files': 0, 'eb_files': 0},
-        'actions': {'commits': 0, 'mrs': 0, 'tags': 0, 'deployments': 0, 'tag_breakdown': {}},
-        'issues': [],
-        'avg_time_per_project': 150  # Default estimate in seconds
+    # Initialize rollback tracking
+    rollback_data = {
+        'snapshots': []
     }
-
-    dry_run = args.dry_run
-    skip_mr = args.skip_mr
-    force_tags = args.force_tags
-    auto_deploy = args.auto_deploy or args.non_interactive
-    non_interactive = args.non_interactive
-    per_project_prompt = args.per_project_prompt and not args.non_interactive
+    
     show_full = args.full_diff and not args.summary_only
     
     # Load TOKEN from file if not already set
@@ -2038,7 +1962,6 @@ def main():
         log("  1. --token command line argument", "ERROR")
         log("  2. .env file (GITLAB_TOKEN=your_token or TOKEN=your_token)", "ERROR")
         log("  3. token.txt file in script directory", "ERROR")
-        log("  4. Edit TOKEN constant in the script", "ERROR")
         sys.exit(1)
     
     # Validate token
@@ -2048,6 +1971,30 @@ def main():
     if not token_validation['valid']:
         log("Token validation failed. Please check your token and try again.", "ERROR")
         sys.exit(1)
+
+    # Create configuration snapshot
+    try:
+        os.makedirs(LOG_DIR_MIGRATION, exist_ok=True)
+        snapshot_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        config_snapshot_file = os.path.join(LOG_DIR_MIGRATION, f"config_snapshot_{snapshot_timestamp}.json")
+        
+        config_snapshot = {
+            'timestamp': datetime.datetime.now().isoformat(),
+            'feature_branch': FEATURE_BRANCH,
+            'source_branch': SOURCE_BRANCH,
+            'target_parent_version': TARGET_PARENT_VERSION,
+            'new_default_platform': NEW_DEFAULT_PLATFORM,
+            'jira_id': JIRA_ID,
+            'base_url': BASE_URL,
+            'auto_rollback_on_failure': AUTO_ROLLBACK_ON_FAILURE
+        }
+        
+        with open(config_snapshot_file, 'w') as f:
+            json.dump(config_snapshot, f, indent=2)
+        
+        log(f"Configuration snapshot saved to: {config_snapshot_file}", "INFO")
+    except Exception as e:
+        log(f"Warning: Could not save config snapshot: {e}", "WARN")
 
     # Load project IDs
     project_ids = PROJECT_IDS
@@ -2061,178 +2008,180 @@ def main():
         log("Please add PROJECT_IDS or pass --projects.", "ERROR")
         sys.exit(1)
     
-    dry_run_summary['total_projects'] = len(project_ids)
-    
     # Filter out already completed projects if resuming
-    if resume_from_project:
-        completed_set = set(state.get('completed_projects', []))
+    if args.resume and state.get('completed_projects'):
+        completed_set = set(state['completed_projects'])
+        original_count = len(project_ids)
         project_ids = [pid for pid in project_ids if pid not in completed_set]
-        skipped_count = len(completed_set)
+        skipped_count = original_count - len(project_ids)
         if skipped_count > 0:
-            log(f"Skipping {skipped_count} already completed project(s)", "INFO")
-            dry_run_summary['total_projects'] = len(project_ids)
+            log(f"Resuming: Skipping {skipped_count} already completed project(s)", "INFO")
     
-    # WORKFLOW SELECTION
-    skip_file_changes = False
+    # TOP-LEVEL MODE SELECTION
+    mode = args.mode
     
-    if args.workflow:
-        workflow = args.workflow
-    else:
-        # Interactive workflow selection
+    if not mode:
         print("\n" + "=" * 70)
-        print("WORKFLOW SELECTION")
+        print("MIGRATION TOOL - MODE SELECTION")
         print("=" * 70)
-        print("\nChoose your workflow:\n")
-        print("1. MAKE CHANGES + DEPLOY + MR")
-        print("   - Modify files (POM, CI, EB)")
-        print("   - Create/update tags")
-        print("   - Trigger deployment")
-        print("   - Create MR after successful deployment")
+        print("\nChoose your operation mode:\n")
+        print("1. FULL MIGRATION (Changes + Commit + Deploy/MR)")
+        print("   - Show file change previews")
+        print("   - Ask to commit each project")
+        print("   - After commit, choose: Deploy OR Create MR")
         print()
-        print("2. JUST DEPLOY")
-        print("   - Skip file modifications")
-        print("   - Create/update tags only")
-        print("   - Trigger deployment")
+        print("2. BULK MR CREATION")
+        print("   - Create MRs for all projects at once")
+        print("   - Uses existing feature branches")
+        print("   - No file changes or deployments")
+        print()
+        print("3. DEPLOY ONLY")
+        print("   - Skip file changes")
+        print("   - Only handle tag creation and deployment")
         print()
         
-        workflow_choice = input("Choose workflow [1/2] (default: 1): ").strip()
-        
-        if workflow_choice == '2':
-            workflow = 'deploy'
-            skip_file_changes = True
-            log("[INFO] Selected workflow: JUST DEPLOY (skip file changes)", "INFO")
-        else:
-            workflow = 'changes'
-            log("[INFO] Selected workflow: MAKE CHANGES + DEPLOY + MR", "INFO")
-    
-    if workflow == 'deploy':
-        skip_file_changes = True
-        log("[INFO] Workflow: JUST DEPLOY (skip file changes)", "INFO")
-    else:
-        log("[INFO] Workflow: MAKE CHANGES + DEPLOY + MR", "INFO")
-    
-    # TWO-PHASE APPROACH: DRY RUN FIRST, THEN ACTUAL RUN
-    print("\n" + "=" * 70)
-    print("PHASE 1: DRY-RUN (SIMULATION)")
-    print("=" * 70)
-    print("\nRunning dry-run first to show what would change...")
-    print("NO actual changes will be made to GitLab in this phase.\n")
-    
-    # File selection (only if not skipping file changes)
-    global_choices = None
-    if not skip_file_changes and not per_project_prompt:
-        raw_choices = input("Select updates to run for ALL projects (1:POM, 2:CI, 3:EB, 4:ALL, 0:EXIT), e.g. 1,2 or 4 or 0: ").replace(" ", "")
-        
-        if raw_choices == '0' or raw_choices.lower() == 'exit':
-            log("User chose to exit. No changes will be made.", "INFO")
+        try:
+            mode_choice = input("Choose mode [1/2/3] (default: 1): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            log("\n[INTERRUPT] Interrupted during mode selection", "WARN")
             sys.exit(0)
         
-        global_choices = raw_choices.split(',') if raw_choices else []
-        if '4' in global_choices:
-            global_choices = [c for c in global_choices if c != '4']
-            for c in ('3', '2', '1'):
-                if c not in global_choices:
-                    global_choices.insert(0, c)
+        if mode_choice == '2':
+            mode = 'mr_bulk'
+        elif mode_choice == '3':
+            mode = 'deploy_only'
+        else:
+            mode = 'full'
+    
+    log(f"Selected mode: {mode.upper()}", "INFO")
+    
+    # Execute based on mode
+    try:
+        if mode == 'mr_bulk':
+            # BULK MR CREATION
+            bulk_create_mrs(project_ids, rollback_data, state)
+            
+        elif mode == 'deploy_only':
+            # DEPLOY ONLY MODE
+            log("=" * 70, "INFO")
+            log("DEPLOY ONLY MODE", "INFO")
+            log("=" * 70, "INFO")
+            
+            for pid in project_ids:
+                if INTERRUPTED:
+                    log("Migration interrupted", "WARN")
+                    break
+                process_project(pid, mode='deploy_only', rollback_data=rollback_data, state=state)
+            
+        else:
+            # FULL MIGRATION MODE
+            # File selection
+            try:
+                raw_choices = input("\nSelect updates for ALL projects (1:POM, 2:CI, 3:EB, 4:ALL, 0:EXIT): ").replace(" ", "")
+            except (EOFError, KeyboardInterrupt):
+                log("\n[INTERRUPT] Interrupted during file selection", "WARN")
+                sys.exit(0)
+            
+            if raw_choices == '0' or raw_choices.lower() == 'exit':
+                log("User chose to exit.", "INFO")
+                sys.exit(0)
+            
+            global_choices = raw_choices.split(',') if raw_choices else []
+            if '4' in global_choices:
+                global_choices = [c for c in global_choices if c != '4']
+                for c in ('3', '2', '1'):
+                    if c not in global_choices:
+                        global_choices.insert(0, c)
+            
+            log(f"Will apply these updates: {', '.join(['POM' if c=='1' else 'CI' if c=='2' else 'EB' if c=='3' else c for c in global_choices])}", "INFO")
+            
+            # Process projects
+            log("=" * 70, "INFO")
+            log("STARTING MIGRATION", "INFO")
+            log("=" * 70, "INFO")
+            
+            for pid in project_ids:
+                if INTERRUPTED:
+                    log("Migration interrupted", "WARN")
+                    break
+                    
+                try:
+                    process_project(pid, choices=global_choices, show_full=show_full, rollback_data=rollback_data, mode='full', state=state)
+                except KeyboardInterrupt:
+                    log("\n[INTERRUPT] Keyboard interrupt received", "WARN")
+                    INTERRUPTED = True
+                    break
+                except Exception as e:
+                    log(f"Error processing project {pid}: {e}", "ERROR")
         
-        log(f"Will apply these updates to all projects: {', '.join(['POM' if c=='1' else 'CI' if c=='2' else 'EB' if c=='3' else c for c in global_choices])}", "INFO")
-    elif skip_file_changes:
-        log("[INFO] Skipping file selection (deploy-only mode)", "INFO")
-        global_choices = []  # Empty choices for deploy-only mode
-
-    # PHASE 1: DRY RUN
-    log("=" * 70, "INFO")
-    log("STARTING DRY-RUN PHASE", "INFO")
-    log("=" * 70, "INFO")
+        # Save rollback data
+        if rollback_data['snapshots']:
+            rollback_file = save_rollback_data(rollback_data)
+            log(f"\n[SUCCESS] Rollback data saved to: {rollback_file}", "INFO")
+            log(f"To rollback, run: python3 {sys.argv[0]} --rollback {rollback_file}", "INFO")
+        
+        # Save final state
+        if INTERRUPTED:
+            state_file = save_state(state)
+            log(f"\n[INTERRUPT] Migration interrupted. State saved to: {state_file}", "WARN")
+            log(f"To resume, run: python3 {sys.argv[0]} --resume {state_file}", "INFO")
+        
+        # Execution timing summary
+        if project_timings:
+            script_end_time = time.time()
+            total_runtime = script_end_time - script_start_time
+            avg_time = sum(t[1] for t in project_timings) / len(project_timings) if project_timings else 0
+            slowest = max(project_timings, key=lambda x: x[1]) if project_timings else (None, 0)
+            
+            log("\n" + "=" * 70, "INFO")
+            log("EXECUTION TIMING SUMMARY", "INFO")
+            log("=" * 70, "INFO")
+            
+            total_minutes = int(total_runtime // 60)
+            total_seconds = int(total_runtime % 60)
+            log(f"Total runtime: {total_minutes}m {total_seconds}s", "INFO")
+            log(f"Average per project: {int(avg_time)}s", "INFO")
+            
+            if slowest[0]:
+                log(f"Slowest project: {slowest[0]} ({int(slowest[1])}s)", "INFO")
+        
+        log("\n" + "=" * 70, "INFO")
+        if INTERRUPTED:
+            log("MIGRATION INTERRUPTED", "WARN")
+        else:
+            log("MIGRATION COMPLETE", "INFO")
+        log("=" * 70, "INFO")
+        
+        # Summary
+        if state:
+            log(f"\nSummary:", "INFO")
+            log(f"  Completed: {len(state.get('completed_projects', []))} projects", "INFO")
+            log(f"  Failed: {len(state.get('failed_projects', []))} projects", "INFO")
+            log(f"  Skipped: {len(state.get('skipped_projects', []))} projects", "INFO")
+            
+            # Idempotency summary (if available from results)
+            if state.get('idempotency_stats'):
+                stats = state['idempotency_stats']
+                if stats.get('idempotent_commits', 0) > 0 or stats.get('idempotent_mrs', 0) > 0 or stats.get('idempotent_tags', 0) > 0:
+                    log(f"\nIdempotency Guards Triggered:", "INFO")
+                    if stats.get('idempotent_commits', 0) > 0:
+                        log(f"  Skipped commits (files already match): {stats['idempotent_commits']}", "INFO")
+                    if stats.get('idempotent_mrs', 0) > 0:
+                        log(f"  Skipped MRs (already exist): {stats['idempotent_mrs']}", "INFO")
+                    if stats.get('idempotent_tags', 0) > 0:
+                        log(f"  Skipped tag recreations (already at HEAD): {stats['idempotent_tags']}", "INFO")
     
-    process_in_batches(
-        project_ids,
-        batch_size=args.batch_size,
-        batch_delay=args.batch_delay,
-        per_project_prompt=per_project_prompt,
-        dry_run=True,  # Force dry-run
-        skip_mr=skip_mr,
-        show_full=show_full,
-        choices=global_choices,
-        force_tags=force_tags,
-        auto_deploy=False,  # Disable auto-deploy in dry-run
-        non_interactive=non_interactive,
-        state=state,
-        rollback_data=rollback_data,
-        dry_run_summary=dry_run_summary,
-        skip_file_changes=skip_file_changes,
-        enable_tag_deploy=False  # Disable tag/deploy in dry-run phase
-    )
-    
-    # Generate dry-run summary
-    generate_dry_run_summary(dry_run_summary)
-    
-    # PHASE 2: ASK IF USER WANTS TO COMMIT ACTUAL CHANGES
-    print("\n" + "=" * 70)
-    print("PHASE 2: ACTUAL RUN (OPTIONAL)")
-    print("=" * 70)
-    print("\nThe dry-run is complete. You've seen what would change.\n")
-    
-    if not prompt_yes_no("Do you want to commit these changes for REAL?", default=False, non_interactive=False):
-        log("User chose not to proceed with actual changes. Exiting.", "INFO")
-        sys.exit(0)
-    
-    # User wants to commit changes
-    print("\n" + "[ACTUAL] " + "=" * 60)
-    print("[ACTUAL] COMMITTING ACTUAL CHANGES TO GITLAB")
-    print("[ACTUAL] " + "=" * 60 + "\n")
-    
-    # Ask about tag/deploy
-    enable_tag_deploy = False
-    if prompt_yes_no("After committing changes, do you want to create tags and trigger deployments?", default=True, non_interactive=False):
-        enable_tag_deploy = True
-        log("Tag creation and deployment will be enabled after commits.", "INFO")
-    else:
-        log("Tag creation and deployment will be skipped.", "INFO")
-    
-    # Reset state for actual run
-    state = {
-        'completed_projects': [],
-        'failed_projects': [],
-        'skipped_projects': [],
-        'start_time': datetime.datetime.now().isoformat()
-    }
-    
-    rollback_data = {
-        'snapshots': []
-    }
-    
-    # ACTUAL RUN
-    log("=" * 70, "INFO")
-    log("STARTING ACTUAL MIGRATION", "INFO")
-    log("=" * 70, "INFO")
-    
-    process_in_batches(
-        project_ids,
-        batch_size=args.batch_size,
-        batch_delay=args.batch_delay,
-        per_project_prompt=per_project_prompt,
-        dry_run=False,  # Actual run
-        skip_mr=skip_mr,
-        show_full=show_full,
-        choices=global_choices,
-        force_tags=force_tags,
-        auto_deploy=auto_deploy,
-        non_interactive=non_interactive,
-        state=state,
-        rollback_data=rollback_data,
-        dry_run_summary=None,  # No summary for actual run
-        skip_file_changes=skip_file_changes,
-        enable_tag_deploy=enable_tag_deploy  # Enable/disable based on user choice
-    )
-    
-    # Save rollback data
-    if rollback_data['snapshots']:
-        save_rollback_data(rollback_data)
-        log(f"[SUCCESS] Rollback data saved. Use --rollback {ROLLBACK_FILE} to revert changes if needed.", "INFO")
-    
-    log("=" * 70, "INFO")
-    log("MIGRATION COMPLETE", "INFO")
-    log("=" * 70, "INFO")
+    except KeyboardInterrupt:
+        log("\n[INTERRUPT] Keyboard interrupt received", "WARN")
+        INTERRUPTED = True
+        
+        # Save state
+        if state:
+            state_file = save_state(state)
+            log(f"State saved to: {state_file}", "INFO")
+            log(f"To resume, run: python3 {sys.argv[0]} --resume {state_file}", "INFO")
+        
+        sys.exit(1)
 
 
 if __name__ == "__main__":
