@@ -18,24 +18,8 @@ from functools import wraps
 BASE_URL = "" # Will be loaded from .env
 TOKEN = ""  # Will be loaded from .env or token.txt file
 
-# Project names for tab-completion (ADD YOUR 15 PROJECTS HERE)
-PROJECT_NAMES = {
-    101: "user-authentication-service",
-    102: "payment-gateway-api",
-    103: "notification-service",
-    104: "order-management-system",
-    105: "inventory-tracker",
-    106: "customer-portal",
-    107: "admin-dashboard",
-    108: "analytics-engine",
-    109: "reporting-service",
-    110: "data-pipeline",
-    111: "email-service",
-    112: "sms-gateway",
-    113: "file-upload-service",
-    114: "search-indexer",
-    115: "cache-manager"
-}
+# Project names will be loaded from .env file
+PROJECT_NAMES = {}
 
 JIRA_ID = "1293"
 UPGRADE_TYPE = "java17-migration"
@@ -318,6 +302,73 @@ def log(msg, level="INFO"):
     if FILE_LOGGER:
         log_level = getattr(logging, level, logging.INFO)
         FILE_LOGGER.log(log_level, msg)
+
+
+def load_projects_from_env(debug=False):
+    """
+    Load project mappings from .env file.
+    Looks for entries in format: PROJECT_<id>=<name>
+    
+    Returns dict of {id: name} or empty dict if not found.
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    env_file = os.path.join(script_dir, '.env')
+    
+    projects = {}
+    
+    if debug:
+        log(f"Looking for projects in .env file at: {env_file}", "DEBUG")
+    
+    if not os.path.exists(env_file):
+        if debug:
+            log(".env file not found", "DEBUG")
+        return projects
+    
+    try:
+        with open(env_file, 'r') as f:
+            lines = f.readlines()
+            
+            for i, line in enumerate(lines, 1):
+                line = line.strip()
+                
+                # Skip comments and empty lines
+                if not line or line.startswith('#'):
+                    continue
+                
+                # Look for PROJECT_<id>=<name>
+                if '=' in line and line.startswith('PROJECT_'):
+                    try:
+                        key, value = line.split('=', 1)
+                        key = key.strip()
+                        value = value.strip()
+                        
+                        # Remove quotes if present
+                        if value.startswith('"') and value.endswith('"'):
+                            value = value[1:-1]
+                        elif value.startswith("'") and value.endswith("'"):
+                            value = value[1:-1]
+                        
+                        # Extract project ID from key (PROJECT_101 -> 101)
+                        project_id_str = key.replace('PROJECT_', '')
+                        project_id = int(project_id_str)
+                        
+                        projects[project_id] = value
+                        
+                        if debug:
+                            log(f"Loaded project: {project_id} -> {value}", "DEBUG")
+                    except (ValueError, IndexError) as e:
+                        log(f"Error parsing project line {i}: {line} ({e})", "WARN")
+                        continue
+        
+        if projects:
+            log(f"Loaded {len(projects)} project(s) from .env file", "INFO")
+        else:
+            log("No projects found in .env file (looking for PROJECT_<id>=<name> entries)", "WARN")
+            
+    except Exception as e:
+        log(f"Error reading projects from .env file: {e}", "WARN")
+    
+    return projects
 
 
 def load_token_from_file(debug=False):
@@ -1339,7 +1390,7 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
             
             # Update state
             if state is not None:
-                if mr_success:
+                if mr_result['success']:
                     state['completed_projects'].append(pid)
                 else:
                     state['failed_projects'].append(pid)
@@ -1944,6 +1995,126 @@ def bulk_create_mrs(project_ids, rollback_data, state):
     return results
 
 
+def fuzzy_search_projects(projects, search_term):
+    """
+    Find projects matching a search term (case-insensitive partial match).
+    
+    Args:
+        projects: Dict of {id: name}
+        search_term: String to search for
+    
+    Returns:
+        List of (id, name) tuples matching the search
+    """
+    if not search_term:
+        return []
+    
+    search_lower = search_term.lower()
+    matches = []
+    
+    for pid, name in projects.items():
+        # Match if search term is in project name (case-insensitive)
+        if search_lower in name.lower():
+            matches.append((pid, name))
+        # Also match if search term matches project ID
+        elif search_lower in str(pid):
+            matches.append((pid, name))
+    
+    # Sort by name for consistent display
+    return sorted(matches, key=lambda x: x[1])
+
+
+def interactive_project_selection(projects):
+    """
+    Interactive fuzzy search prompt for selecting projects.
+    
+    Args:
+        projects: Dict of {id: name}
+    
+    Returns:
+        List of selected project IDs
+    """
+    selected_ids = []
+    
+    print("\n" + "=" * 70)
+    print("INTERACTIVE PROJECT SELECTION")
+    print("=" * 70)
+    print("\nType part of a project name to search (or press Enter to finish)")
+    print("Commands: 'all' = select all, 'done' = finish selection")
+    print("-" * 70)
+    
+    while True:
+        try:
+            search = input("\nSearch (or 'done'): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            log("\n[INTERRUPT] Project selection cancelled", "WARN")
+            return []
+        
+        # Check if user is done
+        if search.lower() in ['done', 'exit', '']:
+            if selected_ids:
+                break
+            else:
+                print("No projects selected yet. Please select at least one project or type 'exit' to cancel.")
+                continue
+        
+        # Select all projects
+        if search.lower() == 'all':
+            selected_ids = sorted(list(projects.keys()))
+            log(f"Selected all {len(selected_ids)} projects", "INFO")
+            break
+        
+        # Find matches
+        matches = fuzzy_search_projects(projects, search)
+        
+        if not matches:
+            print(f"No matches found for '{search}'. Try a different search term.")
+            continue
+        
+        # Show matches
+        print(f"\nMatches for '{search}':")
+        for i, (pid, name) in enumerate(matches, 1):
+            status = " [SELECTED]" if pid in selected_ids else ""
+            print(f"  {i:>3}. [{pid:>3}] {name}{status}")
+        
+        # Let user select by number
+        try:
+            selection = input(f"\nSelect number (1-{len(matches)}) or Enter to search again: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            log("\n[INTERRUPT] Project selection cancelled", "WARN")
+            return []
+        
+        if not selection:
+            continue
+        
+        # Parse selection
+        try:
+            sel_num = int(selection)
+            if 1 <= sel_num <= len(matches):
+                selected_pid, selected_name = matches[sel_num - 1]
+                
+                if selected_pid in selected_ids:
+                    print(f"Project '{selected_name}' (ID: {selected_pid}) is already selected.")
+                else:
+                    selected_ids.append(selected_pid)
+                    print(f"✓ Added: {selected_name} (ID: {selected_pid})")
+                    print(f"Total selected: {len(selected_ids)} project(s)")
+            else:
+                print(f"Invalid number. Please enter 1-{len(matches)}.")
+        except ValueError:
+            print("Invalid input. Please enter a number.")
+    
+    # Show final selection
+    if selected_ids:
+        print("\n" + "=" * 70)
+        print(f"FINAL SELECTION: {len(selected_ids)} project(s)")
+        print("=" * 70)
+        for pid in selected_ids:
+            print(f"  [{pid:>3}] {projects.get(pid, 'Unknown')}")
+        print("=" * 70)
+    
+    return selected_ids
+
 
 def parse_project_input(user_input, projects):
     """
@@ -2023,7 +2194,7 @@ def parse_project_input(user_input, projects):
 
 
 def main():
-    global TOKEN, PROJECT_IDS, BASE_URL, INTERRUPTED
+    global TOKEN, PROJECT_NAMES, BASE_URL, INTERRUPTED
 
     # Setup signal handlers for graceful interruption
     signal.signal(signal.SIGINT, signal_handler)
@@ -2148,8 +2319,18 @@ def main():
         log(f"🔑 TOKEN ACCESS LEVEL: {access_name} ({access_level})", "INFO")
         log("=" * 70, "INFO")
 
+    # Load projects from .env
+    PROJECT_NAMES = load_projects_from_env()
+    
+    if not PROJECT_NAMES:
+        log("No projects found in .env file. Please add projects in format:", "ERROR")
+        log("  PROJECT_101=user-authentication-service", "ERROR")
+        log("  PROJECT_102=payment-gateway-api", "ERROR")
+        log("  ...", "ERROR")
+        sys.exit(1)
+
     # Load project IDs
-    project_ids = list(PROJECT_NAMES.keys()) if PROJECT_NAMES else []
+    project_ids = []
     if args.projects:
         try:
             project_ids = [int(x.strip()) for x in args.projects.split(",") if x.strip()]
@@ -2157,44 +2338,12 @@ def main():
             log("Invalid --projects value. Provide comma-separated integers.", "ERROR")
             sys.exit(1)
     else:
-        if PROJECT_NAMES:
-            print("\n" + "=" * 70)
-            print("PROJECT SELECTION")
-            print("=" * 70)
-            print("\nAvailable Projects:")
-            
-            for pid, name in sorted(PROJECT_NAMES.items()):
-                print(f"  {pid:>3}: {name}")
-            
-            print("\n" + "-" * 70)
-            print("How to select projects:")
-            print("  - Use IDs: '101,102,103'")
-            print("  - Use names: 'user-authentication-service,payment-gateway-api'")
-            print("  - Use ranges: '101-105'")
-            print("  - Type 'all' to select all projects")
-            print("  - Mix formats: '101,payment-gateway-api,105'")
-            print("-" * 70 + "\n")
-            
-            try:
-                user_input = input("Enter projects: ").strip()
-                project_ids = parse_project_input(user_input, PROJECT_NAMES)
-            except (KeyboardInterrupt, EOFError):
-                log("\n[INTERRUPT] Project selection cancelled", "WARN")
-                sys.exit(0)
-            
-            if not project_ids:
-                log("No valid projects selected.", "ERROR")
-                sys.exit(1)
-            
-            print("\n" + "=" * 70)
-            log(f"Selected {len(project_ids)} project(s):", "INFO")
-            for pid in project_ids:
-                log(f"  {pid:>3}: {PROJECT_NAMES.get(pid, 'Unknown')}", "INFO")
-            print("=" * 70 + "\n")
-    
-    if not project_ids:
-        log("Please add PROJECT_IDS or pass --projects.", "ERROR")
-        sys.exit(1)
+        # Use interactive fuzzy search
+        project_ids = interactive_project_selection(PROJECT_NAMES)
+        
+        if not project_ids:
+            log("No projects selected. Exiting.", "ERROR")
+            sys.exit(1)
     
     # Filter out already completed projects if resuming
     if args.resume and state.get('completed_projects'):
