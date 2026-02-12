@@ -293,6 +293,12 @@ def log(msg, level="INFO"):
 
 
 def load_projects_from_env(debug=False):
+    """
+    Load project mappings from .env file.
+    Looks for entries in format: PROJECT_<id>=<name>
+    
+    Returns dict of {id: name} or empty dict if not found.
+    """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     env_file = os.path.join(script_dir, '.env')
     
@@ -527,6 +533,18 @@ def trigger_manual_job(pid, job_id):
 
 
 def wait_for_job_completion(pid, job_id, timeout=900, check_interval=15):
+    """
+    Wait for a specific job to complete.
+    
+    Args:
+        pid: Project ID
+        job_id: Job ID to monitor
+        timeout: Maximum time to wait in seconds (default: 15 minutes)
+        check_interval: How often to check status in seconds (default: 15s)
+    
+    Returns:
+        Dict with 'status' (success/failed/canceled/timeout) and 'job' object
+    """
     log(f"Waiting for job {job_id} to complete (timeout: {timeout}s)...", "INFO")
     
     start_time = time.time()
@@ -1160,6 +1178,12 @@ def handle_conflict(conflict_info, pid, p_name):
 
 
 def create_mr_for_project(pid, p_name, rollback_data):
+    """
+    Create a merge request for a project.
+    
+    Returns:
+        dict: {'success': bool, 'idempotent': bool, 'url': str or None}
+    """
     log(f"--- Creating MR for: {p_name} (project id: {pid}) ---", "INFO")
     
     # Check for interruption
@@ -1214,6 +1238,20 @@ def create_mr_for_project(pid, p_name, rollback_data):
 
 
 def process_project(pid, choices=None, show_full=True, rollback_data=None, mode='full', state=None):
+    """
+    Process a single project with file changes and/or deployment.
+    
+    Args:
+        pid: Project ID
+        choices: List of file changes to make (1=POM, 2=CI, 3=EB)
+        show_full: Show full diffs vs summary
+        rollback_data: Dict to store rollback snapshots
+        mode: 'full' (changes+deploy/MR), 'mr_only' (just create MR), 'deploy_only' (just deploy)
+        state: State dict for tracking progress
+    
+    Returns:
+        Dict with status information
+    """
     # Check for interruption at start
     if INTERRUPTED:
         log("Processing interrupted before starting project", "WARN")
@@ -1552,6 +1590,17 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
 
 
 def handle_deployment(pid, p_name, state=None):
+    """
+    Handle tag creation and deployment orchestration for a project.
+    
+    Args:
+        pid: Project ID
+        p_name: Project name
+        state: State dict for saving progress at tag level
+    
+    Returns:
+        dict: {'success': bool, 'idempotent_tags': list of tag names that were skipped}
+    """
     log(f"Starting deployment for {p_name}...", "INFO")
     
     # Check for interruption
@@ -1782,6 +1831,17 @@ def handle_deployment(pid, p_name, state=None):
 
 
 def bulk_create_mrs(project_ids, rollback_data, state):
+    """
+    Create merge requests for all projects in bulk.
+    
+    Args:
+        project_ids: List of project IDs
+        rollback_data: Dict to store rollback snapshots
+        state: State dict for tracking progress
+    
+    Returns:
+        Dict with success/failure counts
+    """
     log("=" * 70, "INFO")
     log("BULK MR CREATION MODE", "INFO")
     log("=" * 70, "INFO")
@@ -1833,6 +1893,16 @@ def bulk_create_mrs(project_ids, rollback_data, state):
 
 
 def fuzzy_search_projects(projects, search_term):
+    """
+    Find projects matching a search term (case-insensitive partial match).
+    
+    Args:
+        projects: Dict of {id: name}
+        search_term: String to search for
+    
+    Returns:
+        List of (id, name) tuples matching the search
+    """
     if not search_term:
         return []
     
@@ -1868,8 +1938,34 @@ def interactive_project_selection(projects):
             log("\n[INTERRUPT] Project selection cancelled", "WARN")
             return []
         
-        # Check if user is done
-        if search.lower() in ['done', 'exit', '']:
+        # Check if user wants to exit completely
+        if search.lower() in ['exit', 'quit']:
+            if selected_ids:
+                # Ask for confirmation if projects already selected
+                try:
+                    confirm = input(f"\nYou have {len(selected_ids)} project(s) selected. Exit anyway? [y/N]: ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    sys.exit(0)
+                if confirm in ['y', 'yes']:
+                    log("\n[EXIT] User exited project selection", "INFO")
+                    sys.exit(0)
+                else:
+                    print("Continuing selection...")
+                    continue
+            else:
+                log("\n[EXIT] User exited project selection", "INFO")
+                sys.exit(0)
+        
+        # Check if user is done selecting
+        if search.lower() == 'done':
+            if selected_ids:
+                break
+            else:
+                print("No projects selected yet. Please select at least one project or type 'exit' to cancel.")
+                continue
+        
+        # Empty input - continue prompting
+        if search == '':
             if selected_ids:
                 break
             else:
