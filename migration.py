@@ -120,18 +120,6 @@ def load_state(filename):
 
 
 def create_rollback_snapshot(pid, p_name, branch_name, files_to_backup):
-    """
-    Create a rollback snapshot before making changes.
-    
-    Args:
-        pid: Project ID
-        p_name: Project name
-        branch_name: Branch to snapshot
-        files_to_backup: List of file paths to backup
-    
-    Returns:
-        Snapshot dict with rollback information
-    """
     snapshot = {
         'project_id': pid,
         'project_name': p_name,
@@ -305,12 +293,6 @@ def log(msg, level="INFO"):
 
 
 def load_projects_from_env(debug=False):
-    """
-    Load project mappings from .env file.
-    Looks for entries in format: PROJECT_<id>=<name>
-    
-    Returns dict of {id: name} or empty dict if not found.
-    """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     env_file = os.path.join(script_dir, '.env')
     
@@ -372,15 +354,6 @@ def load_projects_from_env(debug=False):
 
 
 def load_token_from_file(debug=False):
-    """
-    Load GitLab token from .env or token.txt file in the script's directory.
-    
-    Priority:
-    1. .env file (looks for GITLAB_TOKEN=xxx or TOKEN=xxx)
-    2. token.txt file (reads entire content as token)
-    
-    Returns the token string or None if not found.
-    """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     
     if debug:
@@ -474,18 +447,6 @@ def get_pipeline_for_commit(pid, commit_sha):
 
 
 def wait_for_pipeline_completion(pid, pipeline_id, timeout=1800, check_interval=30):
-    """
-    Wait for a pipeline to complete (success, failed, or canceled).
-    
-    Args:
-        pid: Project ID
-        pipeline_id: Pipeline ID to monitor
-        timeout: Maximum time to wait in seconds (default: 30 minutes)
-        check_interval: How often to check status in seconds (default: 30s)
-    
-    Returns:
-        Dict with 'status' (success/failed/canceled/timeout) and 'pipeline' object
-    """
     log(f"Waiting for pipeline {pipeline_id} to complete (timeout: {timeout}s, checking every {check_interval}s)...", "INFO")
     
     start_time = time.time()
@@ -566,18 +527,6 @@ def trigger_manual_job(pid, job_id):
 
 
 def wait_for_job_completion(pid, job_id, timeout=900, check_interval=15):
-    """
-    Wait for a specific job to complete.
-    
-    Args:
-        pid: Project ID
-        job_id: Job ID to monitor
-        timeout: Maximum time to wait in seconds (default: 15 minutes)
-        check_interval: How often to check status in seconds (default: 15s)
-    
-    Returns:
-        Dict with 'status' (success/failed/canceled/timeout) and 'job' object
-    """
     log(f"Waiting for job {job_id} to complete (timeout: {timeout}s)...", "INFO")
     
     start_time = time.time()
@@ -620,17 +569,6 @@ def wait_for_job_completion(pid, job_id, timeout=900, check_interval=15):
 
 
 def map_tag_to_deploy_job(tag_name):
-    """
-    Map tag name to corresponding deploy job name.
-    
-    Examples:
-    - dev -> eb-deploy-dev-azure
-    - azure-dev -> eb-deploy-dev-azure
-    - test -> eb-deploy-test-azure
-    - azure-test -> eb-deploy-test-azure
-    - performance -> eb-deploy-performance-azure
-    - azure-performance -> eb-deploy-performance-azure
-    """
     tag_lower = tag_name.lower().replace('azure-', '')
     
     deploy_jobs = {
@@ -643,12 +581,6 @@ def map_tag_to_deploy_job(tag_name):
 
 
 def validate_and_log_token_info(token, base_url):
-    """
-    Validate the GitLab token and log its metadata including expiry date and access level.
-    
-    Returns:
-        dict with 'valid' (bool) and 'info' (dict with token details)
-    """
     if not token:
         return {'valid': False, 'info': None}
     
@@ -907,20 +839,6 @@ def fetch_all_tags_for_project(pid, per_page=100):
 
 
 def filter_and_sort_deployment_tags(tags):
-    """
-    Filter tags to only include deployment-related tags (dev, test, performance variants)
-    and sort them in deployment order.
-    
-    Priority order:
-    1. dev, azure-dev
-    2. test, azure-test
-    3. performance, azure-performance
-    
-    Returns a dict with:
-    - 'sorted_tags': list of tags in priority order
-    - 'found_categories': dict showing which tag types were found
-    - 'missing_categories': list of missing standard tags
-    """
     if isinstance(tags, dict) and tags.get("error"):
         return {"error": True, "details": tags.get("details")}
     
@@ -1007,17 +925,6 @@ def find_parent_version_in_pom(content):
 
 
 def check_files_already_match(pid, actions, branch_ref):
-    """
-    Check if all files in actions already match their desired state on the branch.
-    
-    Args:
-        pid: Project ID
-        actions: List of action dicts with file_path and content
-        branch_ref: Branch to check against
-    
-    Returns:
-        tuple: (all_match: bool, details: list of file status)
-    """
     all_match = True
     details = []
     
@@ -1046,17 +953,6 @@ def check_files_already_match(pid, actions, branch_ref):
 
 
 def get_file_metadata(pid, file_path, branch_ref):
-    """
-    Get file metadata including last commit info.
-    
-    Args:
-        pid: Project ID
-        file_path: Path to file
-        branch_ref: Branch reference
-    
-    Returns:
-        dict with: last_commit_sha, last_commit_date, last_modified_by, commit_message
-    """
     quoted_path = urllib.parse.quote(file_path, safe='')
     
     try:
@@ -1093,13 +989,6 @@ def get_file_metadata(pid, file_path, branch_ref):
 
 
 def detect_conflicts(pid, file_path, base_content, our_content, remote_ref):
-    """
-    Detect if there are conflicts between our changes and remote changes.
-    
-    Returns:
-        - None if no conflict detected
-        - dict with conflict info if conflict detected
-    """
     quoted_path = urllib.parse.quote(file_path, safe='')
     remote_res = api_call(f"projects/{pid}/repository/files/{quoted_path}?ref={urllib.parse.quote(remote_ref, safe='')}")
     
@@ -1210,16 +1099,6 @@ def attempt_three_way_merge(base_content, our_content, remote_content):
 
 
 def handle_conflict(conflict_info, pid, p_name):
-    """
-    Handle detected conflicts by presenting options to the user.
-    
-    Returns:
-        - "skip": skip this file
-        - "ours": use our version
-        - "theirs": use remote version  
-        - "manual": user will manually merge
-        - content string: merged content to use
-    """
     file_path = conflict_info['file']
     
     if conflict_info['type'] == 'already_applied':
@@ -1281,12 +1160,6 @@ def handle_conflict(conflict_info, pid, p_name):
 
 
 def create_mr_for_project(pid, p_name, rollback_data):
-    """
-    Create a merge request for a project.
-    
-    Returns:
-        dict: {'success': bool, 'idempotent': bool, 'url': str or None}
-    """
     log(f"--- Creating MR for: {p_name} (project id: {pid}) ---", "INFO")
     
     # Check for interruption
@@ -1341,20 +1214,6 @@ def create_mr_for_project(pid, p_name, rollback_data):
 
 
 def process_project(pid, choices=None, show_full=True, rollback_data=None, mode='full', state=None):
-    """
-    Process a single project with file changes and/or deployment.
-    
-    Args:
-        pid: Project ID
-        choices: List of file changes to make (1=POM, 2=CI, 3=EB)
-        show_full: Show full diffs vs summary
-        rollback_data: Dict to store rollback snapshots
-        mode: 'full' (changes+deploy/MR), 'mr_only' (just create MR), 'deploy_only' (just deploy)
-        state: State dict for tracking progress
-    
-    Returns:
-        Dict with status information
-    """
     # Check for interruption at start
     if INTERRUPTED:
         log("Processing interrupted before starting project", "WARN")
@@ -1693,17 +1552,6 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
 
 
 def handle_deployment(pid, p_name, state=None):
-    """
-    Handle tag creation and deployment orchestration for a project.
-    
-    Args:
-        pid: Project ID
-        p_name: Project name
-        state: State dict for saving progress at tag level
-    
-    Returns:
-        dict: {'success': bool, 'idempotent_tags': list of tag names that were skipped}
-    """
     log(f"Starting deployment for {p_name}...", "INFO")
     
     # Check for interruption
@@ -1934,17 +1782,6 @@ def handle_deployment(pid, p_name, state=None):
 
 
 def bulk_create_mrs(project_ids, rollback_data, state):
-    """
-    Create merge requests for all projects in bulk.
-    
-    Args:
-        project_ids: List of project IDs
-        rollback_data: Dict to store rollback snapshots
-        state: State dict for tracking progress
-    
-    Returns:
-        Dict with success/failure counts
-    """
     log("=" * 70, "INFO")
     log("BULK MR CREATION MODE", "INFO")
     log("=" * 70, "INFO")
@@ -1996,16 +1833,6 @@ def bulk_create_mrs(project_ids, rollback_data, state):
 
 
 def fuzzy_search_projects(projects, search_term):
-    """
-    Find projects matching a search term (case-insensitive partial match).
-    
-    Args:
-        projects: Dict of {id: name}
-        search_term: String to search for
-    
-    Returns:
-        List of (id, name) tuples matching the search
-    """
     if not search_term:
         return []
     
@@ -2025,15 +1852,6 @@ def fuzzy_search_projects(projects, search_term):
 
 
 def interactive_project_selection(projects):
-    """
-    Interactive fuzzy search prompt for selecting projects.
-    
-    Args:
-        projects: Dict of {id: name}
-    
-    Returns:
-        List of selected project IDs
-    """
     selected_ids = []
     
     print("\n" + "=" * 70)
@@ -2117,23 +1935,6 @@ def interactive_project_selection(projects):
 
 
 def parse_project_input(user_input, projects):
-    """
-    Parse user input and return list of project IDs.
-    
-    Supports:
-    - Project IDs: "101,102,103"
-    - Project names: "user-authentication-service,payment-gateway-api"
-    - Mixed: "101,payment-gateway-api,103"
-    - Ranges: "101-105"
-    - 'all' keyword
-    
-    Args:
-        user_input: String from user
-        projects: Dict of {id: name}
-    
-    Returns:
-        List of project IDs
-    """
     if not user_input or user_input.strip().lower() == 'all':
         return sorted(list(projects.keys()))
     
