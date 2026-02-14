@@ -13,11 +13,37 @@ import os
 import logging
 import signal
 from functools import wraps
+from prompt_toolkit import prompt
+from prompt_toolkit.completion import WordCompleter, Completer, Completion
+from prompt_toolkit.document import Document
+
+# Try to import enhanced libraries (Option 2)
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+
+try:
+    from colorama import init as colorama_init, Fore, Style, Back
+    colorama_init(autoreset=True)
+    COLORAMA_AVAILABLE = True
+except ImportError:
+    COLORAMA_AVAILABLE = False
+    # Fallback - empty strings
+    class Fore:
+        RED = GREEN = YELLOW = CYAN = MAGENTA = BLUE = WHITE = RESET = ''
+    class Style:
+        BRIGHT = DIM = RESET_ALL = ''
+    class Back:
+        RED = GREEN = YELLOW = CYAN = MAGENTA = BLUE = WHITE = BLACK = RESET = ''
 
 # --- CONFIGURATION (edit as needed) ---
 BASE_URL = "" # Will be loaded from .env
 TOKEN = ""  # Will be loaded from .env or token.txt file
-PROJECT_IDS = [101, 102]  # Add all project IDs here or pass --projects
+
+# Project names will be loaded from .env file
+PROJECT_NAMES = {}
 
 JIRA_ID = "1293"
 UPGRADE_TYPE = "java17-migration"
@@ -29,6 +55,23 @@ TARGET_PARENT_VERSION = "1.8.3"
 NEW_DEFAULT_PLATFORM = "arn:aws:elasticbeanstalk:us-east-1::platform/Corretto 17 running on 64bit Amazon Linux 2/3.10.3"
 
 AUTO_ROLLBACK_ON_FAILURE = True
+
+# NEW FEATURES CONFIGURATION
+# Feature #3: Progress Indicators (use tqdm if available, else simple text)
+SHOW_PROGRESS = True
+USE_FANCY_PROGRESS = TQDM_AVAILABLE  # Auto-detect tqdm
+
+# Feature #5: Smart Diff Viewer (use colorama if available, else plain text)
+USE_COLORED_DIFFS = COLORAMA_AVAILABLE  # Auto-detect colorama
+
+# Feature #7: Smart Retry with Exponential Backoff
+ENABLE_RETRY = True
+MAX_RETRIES = 3
+RETRY_INITIAL_DELAY = 2  # seconds
+RETRY_BACKOFF_FACTOR = 2  # exponential backoff multiplier
+
+# Feature #13: Interactive Approval Workflow
+INTERACTIVE_APPROVAL = True  # Ask for approval before each project
 # ---------------------------------------------------------
 
 # Global variables for state management
@@ -201,6 +244,12 @@ def load_rollback_data(filename):
 
 
 def perform_rollback(rollback_file):
+    """
+    Rollback changes from a previous migration.
+    
+    Args:
+        rollback_file: Path to rollback JSON file
+    """
     log("=" * 70, "INFO")
     log("ROLLBACK MODE", "INFO")
     log("=" * 70, "INFO")
@@ -282,6 +331,430 @@ def log(msg, level="INFO"):
     if FILE_LOGGER:
         log_level = getattr(logging, level, logging.INFO)
         FILE_LOGGER.log(log_level, msg)
+
+
+# ============================================================================
+# FEATURE #3: RICH PROGRESS INDICATORS
+# ============================================================================
+
+class ProgressTracker:
+    """
+    Feature #3: Progress tracking with ETA calculation.
+    Supports both fancy (tqdm) and simple (text-based) progress indicators.
+    """
+    
+    def __init__(self, total_projects, use_fancy=USE_FANCY_PROGRESS):
+        self.total = total_projects
+        self.current = 0
+        self.use_fancy = use_fancy and TQDM_AVAILABLE
+        self.start_time = time.time()
+        self.project_times = []
+        self.current_project_name = ""
+        
+        if self.use_fancy:
+            # Option 2: Fancy progress bar with tqdm
+            self.pbar = tqdm(
+                total=total_projects,
+                desc="Migration Progress",
+                unit="project",
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+            )
+        else:
+            # Option 1: Simple text-based progress
+            self.pbar = None
+            self._print_progress()
+    
+    def _print_progress(self):
+        """Simple text-based progress indicator (Option 1)"""
+        if self.use_fancy:
+            return
+        
+        percent = (self.current / self.total * 100) if self.total > 0 else 0
+        bar_length = 40
+        filled = int(bar_length * self.current / self.total) if self.total > 0 else 0
+        bar = '█' * filled + '░' * (bar_length - filled)
+        
+        # Calculate ETA
+        eta_str = self._calculate_eta()
+        
+        status = f"Processing: {self.current_project_name}" if self.current_project_name else "Initializing..."
+        
+        print(f"\n[{bar}] {percent:.1f}% | Project {self.current}/{self.total} | {eta_str}")
+        print(f"Status: {status}")
+    
+    def _calculate_eta(self):
+        """Calculate estimated time remaining"""
+        if self.current == 0:
+            return "ETA: Calculating..."
+        
+        elapsed = time.time() - self.start_time
+        avg_time_per_project = elapsed / self.current
+        remaining_projects = self.total - self.current
+        eta_seconds = avg_time_per_project * remaining_projects
+        
+        if eta_seconds < 60:
+            return f"ETA: {int(eta_seconds)}s"
+        elif eta_seconds < 3600:
+            return f"ETA: {int(eta_seconds / 60)}m {int(eta_seconds % 60)}s"
+        else:
+            hours = int(eta_seconds / 3600)
+            minutes = int((eta_seconds % 3600) / 60)
+            return f"ETA: {hours}h {minutes}m"
+    
+    def update(self, project_name=""):
+        """Update progress for one project"""
+        self.current += 1
+        self.current_project_name = project_name
+        
+        if self.use_fancy:
+            self.pbar.set_postfix_str(f"Current: {project_name}")
+            self.pbar.update(1)
+        else:
+            self._print_progress()
+    
+    def set_status(self, status):
+        """Update current status message"""
+        if self.use_fancy:
+            self.pbar.set_postfix_str(status)
+        else:
+            print(f"  → {status}")
+    
+    def close(self):
+        """Close the progress tracker"""
+        if self.use_fancy and self.pbar:
+            self.pbar.close()
+        else:
+            print("\n" + "=" * 70)
+
+
+# ============================================================================
+# FEATURE #5: SMART DIFF VIEWER
+# ============================================================================
+
+def show_colored_diff(path, old_content, new_content, use_colors=USE_COLORED_DIFFS):
+    """
+    Feature #5: Smart Diff Viewer with optional color coding.
+    
+    Shows a unified diff with color highlighting if colorama is available.
+    Falls back to plain text diff otherwise.
+    
+    Args:
+        path: File path being compared
+        old_content: Original file content
+        new_content: New file content
+        use_colors: Whether to use colored output (auto-detected)
+    
+    Returns:
+        Formatted diff string
+    """
+    old_lines = old_content.splitlines(keepends=True)
+    new_lines = new_content.splitlines(keepends=True)
+    
+    diff_lines = list(difflib.unified_diff(
+        old_lines, new_lines,
+        fromfile=f"{path} (current)",
+        tofile=f"{path} (new)",
+        lineterm=''
+    ))
+    
+    if not diff_lines:
+        return f"No changes for {path}"
+    
+    # Option 2: Colored diff
+    if use_colors and COLORAMA_AVAILABLE:
+        colored_lines = []
+        for line in diff_lines:
+            line = line.rstrip()
+            if line.startswith('+++') or line.startswith('---'):
+                colored_lines.append(f"{Style.BRIGHT}{Fore.CYAN}{line}{Style.RESET_ALL}")
+            elif line.startswith('+'):
+                colored_lines.append(f"{Fore.GREEN}{line}{Style.RESET_ALL}")
+            elif line.startswith('-'):
+                colored_lines.append(f"{Fore.RED}{line}{Style.RESET_ALL}")
+            elif line.startswith('@@'):
+                colored_lines.append(f"{Style.BRIGHT}{Fore.MAGENTA}{line}{Style.RESET_ALL}")
+            else:
+                colored_lines.append(line)
+        return '\n'.join(colored_lines)
+    
+    # Option 1: Plain text diff
+    return '\n'.join(line.rstrip() for line in diff_lines)
+
+
+def show_side_by_side_diff(path, old_content, new_content, context_lines=3, use_colors=USE_COLORED_DIFFS):
+    """
+    Feature #5: Side-by-side diff viewer for easier comparison.
+    
+    Shows old and new content side by side with change indicators.
+    """
+    old_lines = old_content.splitlines()
+    new_lines = new_content.splitlines()
+    
+    # Use difflib to get matching blocks
+    matcher = difflib.SequenceMatcher(None, old_lines, new_lines)
+    
+    output = []
+    output.append(f"\n{'=' * 70}")
+    output.append(f"SIDE-BY-SIDE DIFF: {path}")
+    output.append(f"{'=' * 70}")
+    output.append(f"{'OLD VERSION':<35} | {'NEW VERSION':<35}")
+    output.append(f"{'-' * 35}-+-{'-' * 35}")
+    
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == 'equal':
+            # Show only limited context
+            if i2 - i1 > context_lines * 2:
+                # Show first few and last few lines
+                for i in range(i1, i1 + context_lines):
+                    if i < i2:
+                        line = old_lines[i][:33] if len(old_lines[i]) > 33 else old_lines[i]
+                        output.append(f"  {line:<33} |   {line:<33}")
+                output.append(f"  {'...':<33} |   {'...':<33}")
+                for i in range(i2 - context_lines, i2):
+                    if i >= i1:
+                        line = old_lines[i][:33] if len(old_lines[i]) > 33 else old_lines[i]
+                        output.append(f"  {line:<33} |   {line:<33}")
+            else:
+                for i in range(i1, i2):
+                    line = old_lines[i][:33] if len(old_lines[i]) > 33 else old_lines[i]
+                    output.append(f"  {line:<33} |   {line:<33}")
+        
+        elif tag == 'delete':
+            for i in range(i1, i2):
+                old_line = old_lines[i][:33] if len(old_lines[i]) > 33 else old_lines[i]
+                if use_colors and COLORAMA_AVAILABLE:
+                    output.append(f"{Fore.RED}- {old_line:<33}{Style.RESET_ALL} | {Fore.RED}{'(removed)':<33}{Style.RESET_ALL}")
+                else:
+                    output.append(f"- {old_line:<33} | {'(removed)':<33}")
+        
+        elif tag == 'insert':
+            for j in range(j1, j2):
+                new_line = new_lines[j][:33] if len(new_lines[j]) > 33 else new_lines[j]
+                if use_colors and COLORAMA_AVAILABLE:
+                    output.append(f"{Fore.GREEN}{'(added)':<35}{Style.RESET_ALL} | {Fore.GREEN}+ {new_line:<33}{Style.RESET_ALL}")
+                else:
+                    output.append(f"{'(added)':<35} | + {new_line:<33}")
+        
+        elif tag == 'replace':
+            max_len = max(i2 - i1, j2 - j1)
+            for k in range(max_len):
+                old_line = old_lines[i1 + k][:33] if i1 + k < i2 and len(old_lines[i1 + k]) > 33 else (old_lines[i1 + k] if i1 + k < i2 else '')
+                new_line = new_lines[j1 + k][:33] if j1 + k < j2 and len(new_lines[j1 + k]) > 33 else (new_lines[j1 + k] if j1 + k < j2 else '')
+                
+                if use_colors and COLORAMA_AVAILABLE:
+                    old_display = f"{Fore.RED}- {old_line:<33}{Style.RESET_ALL}" if old_line else f"{'':35}"
+                    new_display = f"{Fore.GREEN}+ {new_line:<33}{Style.RESET_ALL}" if new_line else f"{'':35}"
+                else:
+                    old_display = f"- {old_line:<33}" if old_line else f"{'':35}"
+                    new_display = f"+ {new_line:<33}" if new_line else f"{'':35}"
+                
+                output.append(f"{old_display} | {new_display}")
+    
+    output.append(f"{'=' * 70}\n")
+    return '\n'.join(output)
+
+
+def show_diff_summary(changes):
+    """
+    Feature #5: Show a summary of all changes across files.
+    
+    Args:
+        changes: Dict of {file_path: (old_content, new_content)}
+    
+    Returns:
+        Summary string
+    """
+    if not changes:
+        return "No changes detected"
+    
+    output = []
+    output.append(f"\n{'=' * 70}")
+    output.append(f"CHANGE SUMMARY")
+    output.append(f"{'=' * 70}")
+    
+    for file_path, (old_content, new_content) in changes.items():
+        old_lines = old_content.splitlines()
+        new_lines = new_content.splitlines()
+        
+        # Calculate changes
+        matcher = difflib.SequenceMatcher(None, old_lines, new_lines)
+        additions = 0
+        deletions = 0
+        
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == 'delete':
+                deletions += i2 - i1
+            elif tag == 'insert':
+                additions += j2 - j1
+            elif tag == 'replace':
+                deletions += i2 - i1
+                additions += j2 - j1
+        
+        if USE_COLORED_DIFFS and COLORAMA_AVAILABLE:
+            output.append(f"\n  {Style.BRIGHT}{file_path}{Style.RESET_ALL}")
+            output.append(f"    {Fore.GREEN}+{additions} lines{Style.RESET_ALL}, {Fore.RED}-{deletions} lines{Style.RESET_ALL}")
+        else:
+            output.append(f"\n  {file_path}")
+            output.append(f"    +{additions} lines, -{deletions} lines")
+    
+    output.append(f"\n{'=' * 70}\n")
+    return '\n'.join(output)
+
+
+# ============================================================================
+# FEATURE #13: INTERACTIVE APPROVAL WORKFLOW
+# ============================================================================
+
+def interactive_approval_prompt(project_id, project_name, changes, mode='full'):
+    """
+    Feature #13: Interactive Approval Workflow
+    
+    Show preview of changes and ask user to approve before proceeding.
+    
+    Args:
+        project_id: Project ID
+        project_name: Project name
+        changes: Dict of {file_path: (old_content, new_content)}
+        mode: Migration mode (full, deploy_only, mr_bulk)
+    
+    Returns:
+        Action to take: 'commit', 'skip', 'quit'
+    """
+    if not INTERACTIVE_APPROVAL and mode != 'full':
+        return 'commit'  # Auto-approve for non-interactive modes
+    
+    print("\n" + "=" * 70)
+    if USE_COLORED_DIFFS and COLORAMA_AVAILABLE:
+        print(f"{Style.BRIGHT}{Fore.CYAN}PROJECT APPROVAL REQUIRED{Style.RESET_ALL}")
+    else:
+        print("PROJECT APPROVAL REQUIRED")
+    print("=" * 70)
+    print(f"Project: [{project_id}] {project_name}")
+    print("=" * 70)
+    
+    # Show change summary
+    print(show_diff_summary(changes))
+    
+    # Show detailed file list
+    print("Files to be modified:")
+    for i, file_path in enumerate(changes.keys(), 1):
+        if USE_COLORED_DIFFS and COLORAMA_AVAILABLE:
+            print(f"  {i}. {Fore.YELLOW}{file_path}{Style.RESET_ALL}")
+        else:
+            print(f"  {i}. {file_path}")
+    
+    print("\n" + "-" * 70)
+    print("Options:")
+    if USE_COLORED_DIFFS and COLORAMA_AVAILABLE:
+        print(f"  {Fore.GREEN}[c]{Style.RESET_ALL} Commit changes and continue")
+        print(f"  {Fore.YELLOW}[s]{Style.RESET_ALL} Skip this project")
+        print(f"  {Fore.CYAN}[v]{Style.RESET_ALL} View detailed diffs")
+        print(f"  {Fore.CYAN}[d]{Style.RESET_ALL} View side-by-side diffs")
+        print(f"  {Fore.RED}[q]{Style.RESET_ALL} Quit migration")
+    else:
+        print("  [c] Commit changes and continue")
+        print("  [s] Skip this project")
+        print("  [v] View detailed diffs")
+        print("  [d] View side-by-side diffs")
+        print("  [q] Quit migration")
+    print("-" * 70)
+    
+    while True:
+        try:
+            choice = input("\nYour choice [c/s/v/d/q]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            log("\n[INTERRUPT] User interrupted approval", "WARN")
+            return 'quit'
+        
+        if choice in ['c', 'commit', 'yes', 'y']:
+            return 'commit'
+        elif choice in ['s', 'skip', 'n', 'no']:
+            return 'skip'
+        elif choice in ['q', 'quit', 'exit']:
+            return 'quit'
+        elif choice in ['v', 'view', 'diff']:
+            # Show detailed unified diffs
+            print("\n" + "=" * 70)
+            print("DETAILED CHANGES (Unified Diff)")
+            print("=" * 70)
+            for file_path, (old_content, new_content) in changes.items():
+                print(f"\n{file_path}:")
+                print(show_colored_diff(file_path, old_content, new_content))
+                print()
+            print("=" * 70)
+        elif choice in ['d', 'side', 'sidebyside']:
+            # Show side-by-side diffs
+            for file_path, (old_content, new_content) in changes.items():
+                print(show_side_by_side_diff(file_path, old_content, new_content))
+        else:
+            print(f"Invalid choice '{choice}'. Please enter c, s, v, d, or q.")
+
+
+def load_projects_from_env(debug=False):
+    """
+    Load project mappings from .env file.
+    Looks for entries in format: PROJECT_<id>=<name>
+    
+    Returns dict of {id: name} or empty dict if not found.
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    env_file = os.path.join(script_dir, '.env')
+    
+    projects = {}
+    
+    if debug:
+        log(f"Looking for projects in .env file at: {env_file}", "DEBUG")
+    
+    if not os.path.exists(env_file):
+        if debug:
+            log(".env file not found", "DEBUG")
+        return projects
+    
+    try:
+        with open(env_file, 'r') as f:
+            lines = f.readlines()
+            
+            for i, line in enumerate(lines, 1):
+                line = line.strip()
+                
+                # Skip comments and empty lines
+                if not line or line.startswith('#'):
+                    continue
+                
+                # Look for PROJECT_<id>=<name>
+                if '=' in line and line.startswith('PROJECT_'):
+                    try:
+                        key, value = line.split('=', 1)
+                        key = key.strip()
+                        value = value.strip()
+                        
+                        # Remove quotes if present
+                        if value.startswith('"') and value.endswith('"'):
+                            value = value[1:-1]
+                        elif value.startswith("'") and value.endswith("'"):
+                            value = value[1:-1]
+                        
+                        # Extract project ID from key (PROJECT_101 -> 101)
+                        project_id_str = key.replace('PROJECT_', '')
+                        project_id = int(project_id_str)
+                        
+                        projects[project_id] = value
+                        
+                        if debug:
+                            log(f"Loaded project: {project_id} -> {value}", "DEBUG")
+                    except (ValueError, IndexError) as e:
+                        log(f"Error parsing project line {i}: {line} ({e})", "WARN")
+                        continue
+        
+        if projects:
+            log(f"Loaded {len(projects)} project(s) from .env file", "INFO")
+        else:
+            log("No projects found in .env file (looking for PROJECT_<id>=<name> entries)", "WARN")
+            
+    except Exception as e:
+        log(f"Error reading projects from .env file: {e}", "WARN")
+    
+    return projects
 
 
 def load_token_from_file(debug=False):
@@ -378,18 +851,6 @@ def get_pipeline_for_commit(pid, commit_sha):
 
 
 def wait_for_pipeline_completion(pid, pipeline_id, timeout=1800, check_interval=30):
-    """
-    Wait for a pipeline to complete (success, failed, or canceled).
-    
-    Args:
-        pid: Project ID
-        pipeline_id: Pipeline ID to monitor
-        timeout: Maximum time to wait in seconds (default: 30 minutes)
-        check_interval: How often to check status in seconds (default: 30s)
-    
-    Returns:
-        Dict with 'status' (success/failed/canceled/timeout) and 'pipeline' object
-    """
     log(f"Waiting for pipeline {pipeline_id} to complete (timeout: {timeout}s, checking every {check_interval}s)...", "INFO")
     
     start_time = time.time()
@@ -470,6 +931,18 @@ def trigger_manual_job(pid, job_id):
 
 
 def wait_for_job_completion(pid, job_id, timeout=900, check_interval=15):
+    """
+    Wait for a specific job to complete.
+    
+    Args:
+        pid: Project ID
+        job_id: Job ID to monitor
+        timeout: Maximum time to wait in seconds (default: 15 minutes)
+        check_interval: How often to check status in seconds (default: 15s)
+    
+    Returns:
+        Dict with 'status' (success/failed/canceled/timeout) and 'job' object
+    """
     log(f"Waiting for job {job_id} to complete (timeout: {timeout}s)...", "INFO")
     
     start_time = time.time()
@@ -655,14 +1128,77 @@ def retry(tries=3, delay=1, backoff=2, allowed_exceptions=(Exception,)):
 
 
 @retry(tries=3, delay=1, backoff=2, allowed_exceptions=(Exception,))
+def retry_with_backoff(max_retries=MAX_RETRIES, initial_delay=RETRY_INITIAL_DELAY, backoff_factor=RETRY_BACKOFF_FACTOR):
+    """
+    Feature #7: Smart Retry with Exponential Backoff
+    
+    Decorator that retries a function on failure with exponential backoff.
+    Useful for handling transient API failures.
+    
+    Args:
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay in seconds before first retry
+        backoff_factor: Multiplier for delay on each retry (exponential backoff)
+    
+    Usage:
+        @retry_with_backoff(max_retries=3)
+        def my_api_call():
+            ...
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            if not ENABLE_RETRY:
+                return func(*args, **kwargs)
+            
+            delay = initial_delay
+            last_exception = None
+            
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_exception = e
+                    
+                    # Don't retry on final attempt
+                    if attempt == max_retries:
+                        break
+                    
+                    # Check if it's a retryable error
+                    error_str = str(e).lower()
+                    is_retryable = any(keyword in error_str for keyword in [
+                        'timeout', 'connection', 'network', '429', '500', '502', '503', '504'
+                    ])
+                    
+                    if not is_retryable:
+                        # Non-retryable error, fail immediately
+                        raise
+                    
+                    # Log retry attempt
+                    log(f"API call failed (attempt {attempt + 1}/{max_retries + 1}): {e}", "WARN")
+                    log(f"Retrying in {delay}s...", "INFO")
+                    
+                    time.sleep(delay)
+                    delay *= backoff_factor  # Exponential backoff
+            
+            # All retries exhausted
+            log(f"All {max_retries + 1} attempts failed", "ERROR")
+            raise last_exception
+        
+        return wrapper
+    return decorator
+
+
+@retry_with_backoff(max_retries=MAX_RETRIES)
 def api_call(endpoint, method="GET", data=None):
     """
-    Wrapper for GitLab API calls.
+    Wrapper for GitLab API calls with smart retry support (Feature #7).
 
     Behavior:
       - Raises exceptions on HTTP 429 or any 5xx to allow retry/backoff.
       - For other HTTP errors (4xx except 429) returns a dict with {"error": True, "details": "..."}
       - On success returns parsed JSON or {} when response body empty.
+      - Automatically retries on transient failures with exponential backoff
     """
     url = f"{BASE_URL.rstrip('/')}/{endpoint.lstrip('/')}"
 
@@ -868,17 +1404,6 @@ def find_parent_version_in_pom(content):
 
 
 def check_files_already_match(pid, actions, branch_ref):
-    """
-    Check if all files in actions already match their desired state on the branch.
-    
-    Args:
-        pid: Project ID
-        actions: List of action dicts with file_path and content
-        branch_ref: Branch to check against
-    
-    Returns:
-        tuple: (all_match: bool, details: list of file status)
-    """
     all_match = True
     details = []
     
@@ -906,14 +1431,43 @@ def check_files_already_match(pid, actions, branch_ref):
     return all_match, details
 
 
-def detect_conflicts(pid, file_path, base_content, our_content, remote_ref):
-    """
-    Detect if there are conflicts between our changes and remote changes.
+def get_file_metadata(pid, file_path, branch_ref):
+    quoted_path = urllib.parse.quote(file_path, safe='')
     
-    Returns:
-        - None if no conflict detected
-        - dict with conflict info if conflict detected
-    """
+    try:
+        # Get file info with commit details
+        file_info = api_call(f"projects/{pid}/repository/files/{quoted_path}?ref={urllib.parse.quote(branch_ref, safe='')}")
+        
+        if isinstance(file_info, dict) and not file_info.get("error"):
+            metadata = {
+                'file_path': file_path,
+                'last_commit_sha': file_info.get('last_commit_id', 'unknown'),
+                'last_commit_date': 'unknown',
+                'last_modified_by': 'unknown',
+                'commit_message': 'unknown'
+            }
+            
+            # Get commit details if we have a commit SHA
+            commit_sha = file_info.get('last_commit_id')
+            if commit_sha:
+                try:
+                    commit_info = api_call(f"projects/{pid}/repository/commits/{commit_sha}")
+                    if isinstance(commit_info, dict) and not commit_info.get("error"):
+                        metadata['last_commit_date'] = commit_info.get('committed_date', 'unknown')
+                        metadata['last_modified_by'] = commit_info.get('author_name', 'unknown')
+                        metadata['commit_message'] = commit_info.get('message', 'unknown').split('\n')[0]  # First line only
+                except Exception as e:
+                    log(f"Could not fetch commit details for {file_path}: {e}", "DEBUG")
+            
+            return metadata
+        else:
+            return None
+    except Exception as e:
+        log(f"Error getting metadata for {file_path}: {e}", "DEBUG")
+        return None
+
+
+def detect_conflicts(pid, file_path, base_content, our_content, remote_ref):
     quoted_path = urllib.parse.quote(file_path, safe='')
     remote_res = api_call(f"projects/{pid}/repository/files/{quoted_path}?ref={urllib.parse.quote(remote_ref, safe='')}")
     
@@ -1055,27 +1609,6 @@ def handle_conflict(conflict_info, pid, p_name):
         print(show_unified_diff(file_path, conflict_info['base_content'], conflict_info['remote_content']))
         print(f"{'='*80}\n")
     
-    # Fetch latest commit context for this file
-    try:
-        quoted_file = urllib.parse.quote(file_path, safe='')
-        commits_resp = api_call(f"projects/{pid}/repository/commits?path={quoted_file}&ref_name={urllib.parse.quote(FEATURE_BRANCH, safe='')}&per_page=1")
-        
-        if isinstance(commits_resp, list) and len(commits_resp) > 0:
-            latest_commit = commits_resp[0]
-            commit_sha = latest_commit.get('id', 'unknown')[:8]
-            commit_author = latest_commit.get('author_name', 'unknown')
-            commit_date = latest_commit.get('created_at', 'unknown')
-            commit_msg = latest_commit.get('message', 'unknown').split('\n')[0][:80]
-            
-            print(f"\n--- Latest commit for {file_path} on {FEATURE_BRANCH} ---")
-            print(f"Commit: {commit_sha}")
-            print(f"Author: {commit_author}")
-            print(f"Date: {commit_date}")
-            print(f"Message: {commit_msg}")
-            print(f"{'='*80}\n")
-    except Exception as e:
-        log(f"Could not fetch commit context for {file_path}: {e}", "DEBUG")
-    
     print(f"\nConflict resolution options for {file_path}:")
     print("  1. Use our version (overwrite remote changes)")
     print("  2. Use remote version (discard our changes)")
@@ -1094,7 +1627,6 @@ def handle_conflict(conflict_info, pid, p_name):
             return "ours"
         elif choice == '2':
             log(f"Using remote version for {file_path}", "INFO")
-            log(f"Remote version will be preserved for {file_path}. Our changes will NOT be committed.", "INFO")
             return "theirs"
         elif choice == '3':
             log(f"Skipping {file_path}", "INFO")
@@ -1166,7 +1698,7 @@ def create_mr_for_project(pid, p_name, rollback_data):
         return {'success': False, 'idempotent': False, 'url': None}
 
 
-def process_project(pid, choices=None, show_full=True, rollback_data=None, mode='full', state=None, project_timings=None):
+def process_project(pid, choices=None, show_full=True, rollback_data=None, mode='full', state=None):
     """
     Process a single project with file changes and/or deployment.
     
@@ -1177,7 +1709,6 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
         rollback_data: Dict to store rollback snapshots
         mode: 'full' (changes+deploy/MR), 'mr_only' (just create MR), 'deploy_only' (just deploy)
         state: State dict for tracking progress
-        project_timings: List to track project execution times
     
     Returns:
         Dict with status information
@@ -1218,11 +1749,9 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
             # Update state
             if state is not None:
                 if mr_result['success']:
-                    if pid not in state['completed_projects']:
-                        state['completed_projects'].append(pid)
+                    state['completed_projects'].append(pid)
                 else:
-                    if pid not in state['failed_projects']:
-                        state['failed_projects'].append(pid)
+                    state['failed_projects'].append(pid)
                 save_state(state)
             
             return result
@@ -1281,12 +1810,31 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
                 print(f"\n{'='*70}")
                 print(f"PREVIEW: Proposed changes for {p_name}")
                 print(f"{'='*70}")
+                
+                # Show file metadata first
+                log("Fetching file metadata...", "INFO")
+                for action in actions:
+                    metadata = get_file_metadata(pid, action['file_path'], current_ref)
+                    if metadata:
+                        print(f"\n📄 File: {action['file_path']}")
+                        print(f"   Last modified by: {metadata['last_modified_by']}")
+                        print(f"   Last commit: {metadata['last_commit_sha'][:8] if metadata['last_commit_sha'] != 'unknown' else 'unknown'}")
+                        print(f"   Commit date: {metadata['last_commit_date']}")
+                        print(f"   Commit message: {metadata['commit_message'][:60]}...")
+                    else:
+                        print(f"\n📄 File: {action['file_path']}")
+                        print(f"   (Metadata unavailable)")
+                
+                print()  # Blank line before diffs
+                
+                # Show diffs (using simple view for initial preview)
                 for action in actions:
                     if show_full:
-                        ud = show_unified_diff(action['file_path'], action['old_content'], action['content'])
-                        if ud.strip():
+                        # Feature #5: Use smart diff viewer
+                        diff_output = show_colored_diff(action['file_path'], action['old_content'], action['content'])
+                        if diff_output.strip():
                             print(f"\n--- Diff for {action['file_path']} ---")
-                            print(ud)
+                            print(diff_output)
                             print(f"--- End diff for {action['file_path']} ---\n")
                         else:
                             print(f"   {action['file_path']} -> [+0 | -0 lines] (no textual diff)")
@@ -1297,12 +1845,35 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
                         print(f"   {action['file_path']} -> [+{added} | -{removed} lines]")
                 print(f"{'='*70}\n")
                 
-                # Ask to commit
-                if not prompt_yes_no(f"Commit these changes for {p_name}?", default=True):
-                    log(f"User skipped commit for {p_name}", "INFO")
-                    if state is not None:
-                        if pid not in state['skipped_projects']:
+                # Feature #13: Interactive Approval Workflow
+                if INTERACTIVE_APPROVAL:
+                    # Prepare changes dict for interactive approval
+                    changes = {
+                        action['file_path']: (action['old_content'], action['content'])
+                        for action in actions
+                    }
+                    
+                    approval_action = interactive_approval_prompt(pid, p_name, changes, mode=mode)
+                    
+                    if approval_action == 'quit':
+                        log(f"User chose to quit migration", "INFO")
+                        global INTERRUPTED
+                        INTERRUPTED = True
+                        result['interrupted'] = True
+                        return result
+                    elif approval_action == 'skip':
+                        log(f"User skipped commit for {p_name}", "INFO")
+                        if state is not None:
                             state['skipped_projects'].append(pid)
+                            save_state(state)
+                        return result
+                    # else: approval_action == 'commit', continue with commit
+                else:
+                    # Legacy prompt for non-interactive mode
+                    if not prompt_yes_no(f"Commit these changes for {p_name}?", default=True):
+                        log(f"User skipped commit for {p_name}", "INFO")
+                        if state is not None:
+                        state['skipped_projects'].append(pid)
                         save_state(state)
                     return result
                 
@@ -1327,8 +1898,7 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
                         result['error'] = "Failed to create feature branch"
                         
                         if state is not None:
-                            if pid not in state['failed_projects']:
-                                state['failed_projects'].append(pid)
+                            state['failed_projects'].append(pid)
                             save_state(state)
                         
                         return result
@@ -1370,8 +1940,7 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
                             result['error'] = str(e)
                             
                             if state is not None:
-                                if pid not in state['failed_projects']:
-                                    state['failed_projects'].append(pid)
+                                state['failed_projects'].append(pid)
                                 save_state(state)
                             
                             return result
@@ -1392,11 +1961,6 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
                                 log(f"  ✓ {detail['file']} already matches", "DEBUG")
                         result['committed'] = True  # Mark as "committed" since state is correct
                         result['idempotent_commit'] = True
-                        
-                        # Track idempotency
-                        if state is not None:
-                            state.setdefault('idempotency_stats', {}).setdefault('idempotent_commits', 0)
-                            state['idempotency_stats']['idempotent_commits'] += 1
                     else:
                         log(f"Files need updating on {FEATURE_BRANCH}:", "INFO")
                         for detail in match_details:
@@ -1425,8 +1989,7 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
                                 perform_rollback(rollback_file)
                             
                             if state is not None:
-                                if pid not in state['failed_projects']:
-                                    state['failed_projects'].append(pid)
+                                state['failed_projects'].append(pid)
                                 save_state(state)
                             
                             return result
@@ -1462,11 +2025,6 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
                 result['idempotent_mr'] = mr_result['idempotent']
                 result['success'] = result['committed'] or mr_result['success']
                 
-                # Track idempotency
-                if state is not None and mr_result['idempotent']:
-                    state.setdefault('idempotency_stats', {}).setdefault('idempotent_mrs', 0)
-                    state['idempotency_stats']['idempotent_mrs'] += 1
-                
             elif choice == '3':
                 # Skip
                 log(f"Skipping deployment/MR for {p_name}", "INFO")
@@ -1474,24 +2032,17 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
                 
             else:
                 # Default: Deploy (option 1)
-                deploy_result = handle_deployment(pid, p_name)
+                deploy_result = handle_deployment(pid, p_name, state)
                 result['deployed'] = deploy_result['success']
                 result['idempotent_tags'] = deploy_result['idempotent_tags']
                 result['success'] = result['committed'] or deploy_result['success']
-                
-                # Track idempotency
-                if state is not None and deploy_result['idempotent_tags']:
-                    state.setdefault('idempotency_stats', {}).setdefault('idempotent_tags', 0)
-                    state['idempotency_stats']['idempotent_tags'] += len(deploy_result['idempotent_tags'])
         
         # Update state
         if state is not None:
             if result['success']:
-                if pid not in state['completed_projects']:
-                    state['completed_projects'].append(pid)
+                state['completed_projects'].append(pid)
             else:
-                if pid not in state['failed_projects']:
-                    state['failed_projects'].append(pid)
+                state['failed_projects'].append(pid)
             save_state(state)
         
         # Log completion time
@@ -1504,10 +2055,6 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
             log(f"[COMPLETE] Completed {p_name} in {minutes}m {seconds}s", "INFO")
         else:
             log(f"[COMPLETE] Completed {p_name} in {seconds}s", "INFO")
-        
-        # Track timing for summary
-        if project_timings is not None:
-            project_timings.append((p_name, project_duration))
         
         return result
         
@@ -1522,16 +2069,20 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
             perform_rollback(rollback_file)
         
         if state is not None:
-            if pid not in state['failed_projects']:
-                state['failed_projects'].append(pid)
+            state['failed_projects'].append(pid)
             save_state(state)
         
         return result
 
 
-def handle_deployment(pid, p_name):
+def handle_deployment(pid, p_name, state=None):
     """
     Handle tag creation and deployment orchestration for a project.
+    
+    Args:
+        pid: Project ID
+        p_name: Project name
+        state: State dict for saving progress at tag level
     
     Returns:
         dict: {'success': bool, 'idempotent_tags': list of tag names that were skipped}
@@ -1594,6 +2145,21 @@ def handle_deployment(pid, p_name):
     if not selected_tag_names:
         log("No tags selected; skipping deployment.", "INFO")
         return {'success': False, 'idempotent_tags': []}
+    
+    # Check for already completed tags when resuming
+    if state and str(pid) in state.get('project_details', {}):
+        completed_tags = state['project_details'][str(pid)].get('completed_tags', [])
+        if completed_tags:
+            log(f"Found {len(completed_tags)} already completed tag(s) for this project: {', '.join(completed_tags)}", "INFO")
+            original_count = len(selected_tag_names)
+            selected_tag_names = [tag for tag in selected_tag_names if tag not in completed_tags]
+            skipped_count = original_count - len(selected_tag_names)
+            if skipped_count > 0:
+                log(f"Skipping {skipped_count} already completed tag(s) from selection", "INFO")
+            
+            if not selected_tag_names:
+                log("All selected tags already completed. Nothing to do.", "INFO")
+                return {'success': True, 'idempotent_tags': completed_tags}
     
     # Get feature branch head
     branch_info = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
@@ -1719,15 +2285,38 @@ def handle_deployment(pid, p_name):
                         if deploy_result['status'] == 'success':
                             log(f"[SUCCESS] Deployment completed for tag '{tag_name}'!", "INFO")
                             deployment_successful = True
+                            
+                            # Save state after successful tag deployment
+                            if state is not None:
+                                if str(pid) not in state['project_details']:
+                                    state['project_details'][str(pid)] = {
+                                        'completed_tags': [],
+                                        'failed_tags': [],
+                                        'last_pipeline_id': None
+                                    }
+                                state['project_details'][str(pid)]['completed_tags'].append(tag_name)
+                                state['project_details'][str(pid)]['last_pipeline_id'] = pipeline_id
+                                save_state(state)
+                                log(f"State saved: tag '{tag_name}' marked complete for project {pid}", "DEBUG")
                         else:
                             log(f"Deployment {deploy_result['status']} for tag '{tag_name}'", "ERROR")
+                            # Save failed tag
+                            if state is not None:
+                                if str(pid) not in state['project_details']:
+                                    state['project_details'][str(pid)] = {
+                                        'completed_tags': [],
+                                        'failed_tags': [],
+                                        'last_pipeline_id': None
+                                    }
+                                state['project_details'][str(pid)]['failed_tags'].append(tag_name)
+                                save_state(state)
         else:
             log(f"No commit available for tag '{tag_name}', skipping deployment", "WARN")
     
     return {'success': deployment_successful, 'idempotent_tags': idempotent_tags}
 
 
-def bulk_create_mrs(project_ids, rollback_data, state, project_timings=None):
+def bulk_create_mrs(project_ids, rollback_data, state):
     """
     Create merge requests for all projects in bulk.
     
@@ -1735,7 +2324,6 @@ def bulk_create_mrs(project_ids, rollback_data, state, project_timings=None):
         project_ids: List of project IDs
         rollback_data: Dict to store rollback snapshots
         state: State dict for tracking progress
-        project_timings: List to track project execution times
     
     Returns:
         Dict with success/failure counts
@@ -1760,7 +2348,7 @@ def bulk_create_mrs(project_ids, rollback_data, state, project_timings=None):
             break
         
         try:
-            result = process_project(pid, mode='mr_only', rollback_data=rollback_data, state=state, project_timings=project_timings)
+            result = process_project(pid, mode='mr_only', rollback_data=rollback_data, state=state)
             
             if result.get('interrupted'):
                 results['interrupted'] += 1
@@ -1790,16 +2378,284 @@ def bulk_create_mrs(project_ids, rollback_data, state, project_timings=None):
     return results
 
 
+class ProjectCompleter(Completer):
+    """
+    Custom completer for project selection with tab autocomplete.
+    Suggests project names when typing 3+ characters.
+    """
+    def __init__(self, projects):
+        """
+        Args:
+            projects: Dict of {id: name}
+        """
+        self.projects = projects
+        # Create a mapping of project names to IDs for easy lookup
+        self.name_to_id = {name: pid for pid, name in projects.items()}
+        self.project_names = sorted(projects.values())
+    
+    def get_completions(self, document, complete_event):
+        """
+        Generate completions based on current input.
+        Only shows suggestions for inputs with 3+ characters.
+        """
+        text = document.text_before_cursor.strip().lower()
+        
+        # Special commands - always complete
+        special_commands = ['all', 'done', 'exit', 'quit']
+        for cmd in special_commands:
+            if cmd.startswith(text) and len(text) > 0:
+                yield Completion(
+                    cmd,
+                    start_position=-len(text),
+                    display=f"[{cmd.upper()}]",
+                    display_meta="Command"
+                )
+        
+        # Only show project completions for 3+ characters
+        if len(text) >= 3:
+            # Find matching project names
+            matches = []
+            for name in self.project_names:
+                if text in name.lower():
+                    pid = self.name_to_id[name]
+                    matches.append((name, pid))
+            
+            # Sort matches by name
+            matches.sort()
+            
+            # Yield completions
+            for name, pid in matches:
+                yield Completion(
+                    name,
+                    start_position=-len(text),
+                    display=f"[{pid}] {name}",
+                    display_meta=f"ID: {pid}"
+                )
+
+
+def interactive_project_selection(projects):
+    """
+    Interactive project selection using prompt_toolkit with tab autocomplete.
+    Type 3+ characters and press Tab to see suggestions.
+    
+    Args:
+        projects: Dict of {id: name}
+    
+    Returns:
+        List of selected project IDs
+    """
+    selected_ids = []
+    completer = ProjectCompleter(projects)
+    
+    print("\n" + "=" * 70)
+    print("INTERACTIVE PROJECT SELECTION (with Tab Autocomplete)")
+    print("=" * 70)
+    print("\nType 3+ characters and press TAB to see project suggestions")
+    print("Commands:")
+    print("  'all'  - select all projects")
+    print("  'done' - finish selection (or just press Enter)")
+    print("  'exit' - exit the script")
+    print("-" * 70)
+    
+    # Create reverse lookup: name -> id
+    name_to_id = {name: pid for pid, name in projects.items()}
+    
+    while True:
+        try:
+            # Use prompt_toolkit for autocomplete
+            search = prompt(
+                "\nSearch project (Tab for autocomplete): ",
+                completer=completer,
+                complete_while_typing=False  # Only complete on Tab
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            log("\n[INTERRUPT] Project selection cancelled", "WARN")
+            return []
+        
+        # Check if user wants to exit completely
+        if search.lower() in ['exit', 'quit']:
+            if selected_ids:
+                # Ask for confirmation if projects already selected
+                try:
+                    confirm = input(f"\nYou have {len(selected_ids)} project(s) selected. Exit anyway? [y/N]: ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    sys.exit(0)
+                if confirm in ['y', 'yes']:
+                    log("\n[EXIT] User exited project selection", "INFO")
+                    sys.exit(0)
+                else:
+                    print("Continuing selection...")
+                    continue
+            else:
+                log("\n[EXIT] User exited project selection", "INFO")
+                sys.exit(0)
+        
+        # Check if user is done selecting
+        if search.lower() == 'done' or search == '':
+            if selected_ids:
+                break
+            else:
+                print("No projects selected yet. Please select at least one project or type 'exit' to cancel.")
+                continue
+        
+        # Select all projects
+        if search.lower() == 'all':
+            selected_ids = sorted(list(projects.keys()))
+            log(f"Selected all {len(selected_ids)} projects", "INFO")
+            break
+        
+        # Check if input is a project name
+        if search in name_to_id:
+            selected_pid = name_to_id[search]
+            
+            if selected_pid in selected_ids:
+                print(f"Project '{search}' (ID: {selected_pid}) is already selected.")
+            else:
+                selected_ids.append(selected_pid)
+                print(f"✓ Added: {search} (ID: {selected_pid})")
+                print(f"Total selected: {len(selected_ids)} project(s)")
+            continue
+        
+        # Check if input is a project ID
+        if search.isdigit():
+            pid = int(search)
+            if pid in projects:
+                if pid in selected_ids:
+                    print(f"Project ID {pid} is already selected.")
+                else:
+                    selected_ids.append(pid)
+                    print(f"✓ Added: {projects[pid]} (ID: {pid})")
+                    print(f"Total selected: {len(selected_ids)} project(s)")
+            else:
+                print(f"Project ID {pid} not found.")
+            continue
+        
+        # Search for partial matches
+        search_lower = search.lower()
+        matches = []
+        
+        for pid, name in projects.items():
+            if search_lower in name.lower() or search_lower in str(pid):
+                matches.append((pid, name))
+        
+        if not matches:
+            print(f"No matches found for '{search}'. Try typing at least 3 characters and press Tab.")
+            continue
+        
+        # Sort matches by name
+        matches = sorted(matches, key=lambda x: x[1])
+        
+        # Show matches
+        print(f"\nMatches for '{search}':")
+        for i, (pid, name) in enumerate(matches, 1):
+            status = " [SELECTED]" if pid in selected_ids else ""
+            print(f"  {i:>3}. [{pid:>3}] {name}{status}")
+        
+        # Let user select by number
+        try:
+            selection = input(f"\nSelect number (1-{len(matches)}) or Enter to search again: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            log("\n[INTERRUPT] Project selection cancelled", "WARN")
+            return []
+        
+        if not selection:
+            continue
+        
+        # Parse selection
+        try:
+            sel_num = int(selection)
+            if 1 <= sel_num <= len(matches):
+                selected_pid, selected_name = matches[sel_num - 1]
+                
+                if selected_pid in selected_ids:
+                    print(f"Project '{selected_name}' (ID: {selected_pid}) is already selected.")
+                else:
+                    selected_ids.append(selected_pid)
+                    print(f"✓ Added: {selected_name} (ID: {selected_pid})")
+                    print(f"Total selected: {len(selected_ids)} project(s)")
+            else:
+                print(f"Invalid number. Please enter 1-{len(matches)}.")
+        except ValueError:
+            print("Invalid input. Please enter a number.")
+    
+    # Show final selection
+    if selected_ids:
+        print("\n" + "=" * 70)
+        print(f"FINAL SELECTION: {len(selected_ids)} project(s)")
+        print("=" * 70)
+        for pid in selected_ids:
+            print(f"  [{pid:>3}] {projects.get(pid, 'Unknown')}")
+        print("=" * 70)
+    
+    return selected_ids
+
+
+def parse_project_input(user_input, projects):
+    if not user_input or user_input.strip().lower() == 'all':
+        return sorted(list(projects.keys()))
+    
+    # Create reverse lookup: name -> id
+    name_to_id = {name: pid for pid, name in projects.items()}
+    
+    selected = []
+    parts = [p.strip() for p in user_input.split(',')]
+    
+    for part in parts:
+        # Check for range (e.g., "101-105")
+        if '-' in part and not any(c.isalpha() for c in part):
+            try:
+                start, end = part.split('-')
+                start_id = int(start.strip())
+                end_id = int(end.strip())
+                for pid in range(start_id, end_id + 1):
+                    if pid in projects:
+                        selected.append(pid)
+                    else:
+                        log(f"Project ID {pid} not found in range {start}-{end}", "WARN")
+            except ValueError:
+                log(f"Invalid range: {part}", "WARN")
+                continue
+        
+        # Check if it's a project ID
+        elif part.isdigit():
+            pid = int(part)
+            if pid in projects:
+                selected.append(pid)
+            else:
+                log(f"Unknown project ID: {pid}", "WARN")
+        
+        # Check if it's a project name
+        elif part in name_to_id:
+            selected.append(name_to_id[part])
+        
+        # Try fuzzy matching
+        else:
+            matches = [name for name in name_to_id if part.lower() in name.lower()]
+            if len(matches) == 1:
+                log(f"Auto-matched '{part}' to '{matches[0]}'", "INFO")
+                selected.append(name_to_id[matches[0]])
+            elif len(matches) > 1:
+                log(f"Ambiguous project '{part}'. Matches: {', '.join(matches[:3])}", "WARN")
+            else:
+                log(f"Unknown project: {part}", "WARN")
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    result = []
+    for pid in selected:
+        if pid not in seen:
+            seen.add(pid)
+            result.append(pid)
+    
+    return result
+
+
 def main():
-    global TOKEN, PROJECT_IDS, BASE_URL, INTERRUPTED
+    global TOKEN, PROJECT_NAMES, BASE_URL, INTERRUPTED
 
     # Setup signal handlers for graceful interruption
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-
-    # Track execution timing
-    script_start_time = time.time()
-    project_timings = []  # List of tuples: (project_name, duration_seconds)
 
     parser = argparse.ArgumentParser(description="Batch Java migration helper for GitLab projects.")
     parser.add_argument("--projects", help="Comma-separated project IDs to process (overrides PROJECT_IDS)", default="")
@@ -1811,8 +2667,43 @@ def main():
     parser.add_argument("--mode", help="Execution mode", choices=['full', 'mr_bulk', 'deploy_only'], default=None)
     parser.add_argument("--resume", help="Resume from a previous state file", default="")
     
+    # Feature #3: Progress Indicators
+    parser.add_argument("--no-progress", help="Disable progress indicators", action="store_true")
+    parser.add_argument("--simple-progress", help="Force simple text progress (disable tqdm even if available)", action="store_true")
+    
+    # Feature #5: Smart Diff Viewer
+    parser.add_argument("--no-color", help="Disable colored diffs (force plain text)", action="store_true")
+    
+    # Feature #7: Smart Retry
+    parser.add_argument("--no-retry", help="Disable automatic retry on API failures", action="store_true")
+    parser.add_argument("--max-retries", help="Maximum number of retry attempts (default: 3)", type=int, default=3)
+    
+    # Feature #13: Interactive Approval
+    parser.add_argument("--no-approval", help="Skip interactive approval (auto-approve all changes)", action="store_true")
+    
     args = parser.parse_args()
-
+    
+    # Apply feature configurations from command-line arguments
+    global SHOW_PROGRESS, USE_FANCY_PROGRESS, USE_COLORED_DIFFS, ENABLE_RETRY, MAX_RETRIES, INTERACTIVE_APPROVAL
+    
+    if args.no_progress:
+        SHOW_PROGRESS = False
+    
+    if args.simple_progress:
+        USE_FANCY_PROGRESS = False
+    
+    if args.no_color:
+        USE_COLORED_DIFFS = False
+    
+    if args.no_retry:
+        ENABLE_RETRY = False
+    
+    if args.max_retries:
+        MAX_RETRIES = args.max_retries
+    
+    if args.no_approval:
+        INTERACTIVE_APPROVAL = False
+    
     # Handle rollback mode
     if args.rollback:
         perform_rollback(args.rollback)
@@ -1827,7 +2718,8 @@ def main():
         'completed_projects': [],
         'failed_projects': [],
         'skipped_projects': [],
-        'start_time': datetime.datetime.now().isoformat()
+        'start_time': datetime.datetime.now().isoformat(),
+        'project_details': {}  # Enhanced: track per-project state including tags and deployments
     }
     
     # Resume from previous state if requested
@@ -1903,42 +2795,95 @@ def main():
     if not token_validation['valid']:
         log("Token validation failed. Please check your token and try again.", "ERROR")
         sys.exit(1)
-
-    # Create configuration snapshot
-    try:
-        os.makedirs(LOG_DIR_MIGRATION, exist_ok=True)
-        snapshot_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        config_snapshot_file = os.path.join(LOG_DIR_MIGRATION, f"config_snapshot_{snapshot_timestamp}.json")
-        
-        config_snapshot = {
-            'timestamp': datetime.datetime.now().isoformat(),
-            'feature_branch': FEATURE_BRANCH,
-            'source_branch': SOURCE_BRANCH,
-            'target_parent_version': TARGET_PARENT_VERSION,
-            'new_default_platform': NEW_DEFAULT_PLATFORM,
-            'jira_id': JIRA_ID,
-            'base_url': BASE_URL,
-            'auto_rollback_on_failure': AUTO_ROLLBACK_ON_FAILURE
+    
+    # Log token access level prominently
+    if token_validation.get('info') and token_validation['info'].get('access_level'):
+        access_level = token_validation['info']['access_level']
+        access_level_names = {
+            10: 'Guest',
+            20: 'Reporter',
+            30: 'Developer',
+            40: 'Maintainer',
+            50: 'Owner'
         }
-        
-        with open(config_snapshot_file, 'w') as f:
-            json.dump(config_snapshot, f, indent=2)
-        
-        log(f"Configuration snapshot saved to: {config_snapshot_file}", "INFO")
-    except Exception as e:
-        log(f"Warning: Could not save config snapshot: {e}", "WARN")
+        access_name = access_level_names.get(access_level, f'Level {access_level}')
+        log("=" * 70, "INFO")
+        log(f"🔑 TOKEN ACCESS LEVEL: {access_name} ({access_level})", "INFO")
+        log("=" * 70, "INFO")
+    
+    # Display enabled features
+    log("=" * 70, "INFO")
+    log("ENABLED FEATURES", "INFO")
+    log("=" * 70, "INFO")
+    
+    if SHOW_PROGRESS:
+        if USE_FANCY_PROGRESS and TQDM_AVAILABLE:
+            log("✓ Feature #3: Progress Indicators (Enhanced with tqdm)", "INFO")
+        elif USE_FANCY_PROGRESS and not TQDM_AVAILABLE:
+            log("✓ Feature #3: Progress Indicators (Simple - tqdm not available)", "INFO")
+        else:
+            log("✓ Feature #3: Progress Indicators (Simple text-based)", "INFO")
+    else:
+        log("✗ Feature #3: Progress Indicators (Disabled)", "INFO")
+    
+    if USE_COLORED_DIFFS and COLORAMA_AVAILABLE:
+        log("✓ Feature #5: Smart Diff Viewer (Colored with colorama)", "INFO")
+    elif USE_COLORED_DIFFS and not COLORAMA_AVAILABLE:
+        log("✓ Feature #5: Smart Diff Viewer (Plain - colorama not available)", "INFO")
+    else:
+        log("✓ Feature #5: Smart Diff Viewer (Plain text)", "INFO")
+    
+    if ENABLE_RETRY:
+        log(f"✓ Feature #7: Smart Retry (Max retries: {MAX_RETRIES})", "INFO")
+    else:
+        log("✗ Feature #7: Smart Retry (Disabled)", "INFO")
+    
+    if INTERACTIVE_APPROVAL:
+        log("✓ Feature #13: Interactive Approval Workflow (Enabled)", "INFO")
+    else:
+        log("✗ Feature #13: Interactive Approval (Auto-approve mode)", "INFO")
+    
+    log("=" * 70, "INFO")
+
+    # Load projects from .env
+    PROJECT_NAMES = load_projects_from_env()
+    
+    if not PROJECT_NAMES:
+        log("No projects found in .env file. Please add projects in format:", "ERROR")
+        log("  PROJECT_101=user-authentication-service", "ERROR")
+        log("  PROJECT_102=payment-gateway-api", "ERROR")
+        log("  ...", "ERROR")
+        sys.exit(1)
+
+    # Display available projects
+    print("\n" + "=" * 70)
+    print("AVAILABLE PROJECTS")
+    print("=" * 70)
+    print(f"\nTotal projects found: {len(PROJECT_NAMES)}\n")
+    
+    # Sort projects by ID for consistent display
+    sorted_projects = sorted(PROJECT_NAMES.items(), key=lambda x: x[0])
+    
+    for pid, pname in sorted_projects:
+        print(f"  [{pid:>3}] {pname}")
+    
+    print("=" * 70)
 
     # Load project IDs
-    project_ids = PROJECT_IDS
+    project_ids = []
     if args.projects:
         try:
             project_ids = [int(x.strip()) for x in args.projects.split(",") if x.strip()]
         except Exception:
             log("Invalid --projects value. Provide comma-separated integers.", "ERROR")
             sys.exit(1)
-    if not project_ids:
-        log("Please add PROJECT_IDS or pass --projects.", "ERROR")
-        sys.exit(1)
+    else:
+        # Use interactive fuzzy search
+        project_ids = interactive_project_selection(PROJECT_NAMES)
+        
+        if not project_ids:
+            log("No projects selected. Exiting.", "ERROR")
+            sys.exit(1)
     
     # Filter out already completed projects if resuming
     if args.resume and state.get('completed_projects'):
@@ -1991,7 +2936,7 @@ def main():
     try:
         if mode == 'mr_bulk':
             # BULK MR CREATION
-            bulk_create_mrs(project_ids, rollback_data, state, project_timings)
+            bulk_create_mrs(project_ids, rollback_data, state)
             
         elif mode == 'deploy_only':
             # DEPLOY ONLY MODE
@@ -1999,11 +2944,29 @@ def main():
             log("DEPLOY ONLY MODE", "INFO")
             log("=" * 70, "INFO")
             
+            # Feature #3: Initialize progress tracker
+            if SHOW_PROGRESS:
+                progress = ProgressTracker(len(project_ids), use_fancy=USE_FANCY_PROGRESS)
+            
             for pid in project_ids:
                 if INTERRUPTED:
                     log("Migration interrupted", "WARN")
                     break
-                process_project(pid, mode='deploy_only', rollback_data=rollback_data, state=state, project_timings=project_timings)
+                
+                # Feature #3: Update progress
+                if SHOW_PROGRESS:
+                    project_name = PROJECT_NAMES.get(pid, f"Project {pid}")
+                    progress.set_status(f"Deploying {project_name}")
+                
+                process_project(pid, mode='deploy_only', rollback_data=rollback_data, state=state)
+                
+                # Feature #3: Update progress after completion
+                if SHOW_PROGRESS:
+                    progress.update(project_name)
+            
+            # Feature #3: Close progress tracker
+            if SHOW_PROGRESS:
+                progress.close()
             
         else:
             # FULL MIGRATION MODE
@@ -2032,19 +2995,39 @@ def main():
             log("STARTING MIGRATION", "INFO")
             log("=" * 70, "INFO")
             
+            # Feature #3: Initialize progress tracker
+            if SHOW_PROGRESS:
+                progress = ProgressTracker(len(project_ids), use_fancy=USE_FANCY_PROGRESS)
+            
             for pid in project_ids:
                 if INTERRUPTED:
                     log("Migration interrupted", "WARN")
                     break
                     
                 try:
-                    process_project(pid, choices=global_choices, show_full=show_full, rollback_data=rollback_data, mode='full', state=state, project_timings=project_timings)
+                    # Feature #3: Update progress with project name
+                    if SHOW_PROGRESS:
+                        project_name = PROJECT_NAMES.get(pid, f"Project {pid}")
+                        progress.set_status(f"Processing {project_name}")
+                    
+                    process_project(pid, choices=global_choices, show_full=show_full, rollback_data=rollback_data, mode='full', state=state)
+                    
+                    # Feature #3: Update progress after completion
+                    if SHOW_PROGRESS:
+                        progress.update(project_name)
+                        
                 except KeyboardInterrupt:
                     log("\n[INTERRUPT] Keyboard interrupt received", "WARN")
                     INTERRUPTED = True
                     break
                 except Exception as e:
                     log(f"Error processing project {pid}: {e}", "ERROR")
+                    if SHOW_PROGRESS:
+                        progress.update(PROJECT_NAMES.get(pid, f"Project {pid}"))
+            
+            # Feature #3: Close progress tracker
+            if SHOW_PROGRESS:
+                progress.close()
         
         # Save rollback data
         if rollback_data['snapshots']:
@@ -2057,29 +3040,6 @@ def main():
             state_file = save_state(state)
             log(f"\n[INTERRUPT] Migration interrupted. State saved to: {state_file}", "WARN")
             log(f"To resume, run: python3 {sys.argv[0]} --resume {state_file}", "INFO")
-        
-        # Execution timing summary
-        if project_timings and len(project_timings) > 0:
-            script_end_time = time.time()
-            total_runtime = script_end_time - script_start_time
-            
-            # Safe average calculation
-            avg_time = sum(t[1] for t in project_timings) / len(project_timings)
-            
-            # Safe slowest project calculation
-            slowest = max(project_timings, key=lambda x: x[1])
-            
-            log("\n" + "=" * 70, "INFO")
-            log("EXECUTION TIMING SUMMARY", "INFO")
-            log("=" * 70, "INFO")
-            
-            total_minutes = int(total_runtime // 60)
-            total_seconds = int(total_runtime % 60)
-            log(f"Total runtime: {total_minutes}m {total_seconds}s", "INFO")
-            log(f"Average per project: {int(avg_time)}s", "INFO")
-            
-            if slowest and slowest[0]:
-                log(f"Slowest project: {slowest[0]} ({int(slowest[1])}s)", "INFO")
         
         log("\n" + "=" * 70, "INFO")
         if INTERRUPTED:
@@ -2096,7 +3056,7 @@ def main():
             log(f"  Skipped: {len(state.get('skipped_projects', []))} projects", "INFO")
             
             # Idempotency summary (if available from results)
-            if state.get('idempotency_stats'):
+            if hasattr(state, 'idempotency_stats'):
                 stats = state['idempotency_stats']
                 if stats.get('idempotent_commits', 0) > 0 or stats.get('idempotent_mrs', 0) > 0 or stats.get('idempotent_tags', 0) > 0:
                     log(f"\nIdempotency Guards Triggered:", "INFO")
