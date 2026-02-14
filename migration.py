@@ -45,7 +45,7 @@ TOKEN = ""  # Will be loaded from .env or token.txt file
 # Project names will be loaded from .env file
 PROJECT_NAMES = {}
 
-JIRA_ID = "1293"
+JIRA_ID = "12938"
 UPGRADE_TYPE = "java17-migration"
 FEATURE_BRANCH = f"task-{JIRA_ID}-{UPGRADE_TYPE}"
 SOURCE_BRANCH = "develop"
