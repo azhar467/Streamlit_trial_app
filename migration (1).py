@@ -13,6 +13,8 @@ import os
 import logging
 import signal
 from functools import wraps
+from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import Completer, Completion
 
 # --- CONFIGURATION (edit as needed) ---
 BASE_URL = "" # Will be loaded from .env
@@ -21,14 +23,14 @@ TOKEN = ""  # Will be loaded from .env or token.txt file
 # Project names will be loaded from .env file
 PROJECT_NAMES = {}
 
-JIRA_ID = "1293"
+JIRA_ID = "12938"
 UPGRADE_TYPE = "java17-migration"
 FEATURE_BRANCH = f"task-{JIRA_ID}-{UPGRADE_TYPE}"
 SOURCE_BRANCH = "develop"
 MR_TITLE = f"TASK-{JIRA_ID}: java migration"
 
 TARGET_PARENT_VERSION = "1.8.3"
-NEW_DEFAULT_PLATFORM = "arn:aws:elasticbeanstalk:us-east-1::platform/Corretto 17 running on 64bit Amazon Linux 2/3.10.3"
+NEW_DEFAULT_PLATFORM = "arn:aws:elasticbeanstalk:us-east-1::platform/Corretto 17 running on 64bit Amazon Linux 2/3.10.4"
 
 AUTO_ROLLBACK_ON_FAILURE = True
 # ---------------------------------------------------------
@@ -1920,23 +1922,97 @@ def fuzzy_search_projects(projects, search_term):
     # Sort by name for consistent display
     return sorted(matches, key=lambda x: x[1])
 
+class ProjectCompleter(Completer):
+    """Custom completer for project names with autocomplete support."""
+    
+    def __init__(self, projects):
+        """
+        Initialize completer with projects dict.
+        
+        Args:
+            projects: Dict of {id: name}
+        """
+        self.projects = projects
+        # Create lookup structures
+        self.project_list = [(pid, name) for pid, name in projects.items()]
+        self.project_names = [name for name in projects.values()]
+    
+    def get_completions(self, document, complete_event):
+        """
+        Generate completions based on current input.
+        
+        Args:
+            document: Current document with user input
+            complete_event: Completion event
+        
+        Yields:
+            Completion objects for matching projects
+        """
+        text = document.text_before_cursor.lower()
+        
+        # Skip if text is too short (less than 1 character)
+        if len(text) < 1:
+            return
+        
+        # Find matching projects
+        matches = []
+        for pid, name in self.project_list:
+            name_lower = name.lower()
+            pid_str = str(pid)
+            
+            # Match by project name (case-insensitive)
+            if text in name_lower:
+                matches.append((pid, name, name_lower.index(text)))
+            # Match by project ID
+            elif text in pid_str:
+                matches.append((pid, name, -1))  # Prioritize ID matches
+        
+        # Sort matches: ID matches first, then by position of match in name
+        matches.sort(key=lambda x: (x[2] if x[2] != -1 else -2, x[1]))
+        
+        # Yield completions
+        for pid, name, _ in matches:
+            # Display text shows both ID and name
+            display_text = f"[{pid}] {name}"
+            # Completion text is just the project name
+            yield Completion(
+                name,
+                start_position=-len(document.text_before_cursor),
+                display=display_text,
+                display_meta=f"ID: {pid}"
+            )
 
 def interactive_project_selection(projects):
+    """
+    Interactive project selection with tab-completion support.
+    
+    Args:
+        projects: Dict of {id: name}
+    
+    Returns:
+        List of selected project IDs
+    """
     selected_ids = []
+    session = PromptSession(completer=ProjectCompleter(projects))
+    
+    # Create reverse lookup: name -> id
+    name_to_id = {name: pid for pid, name in projects.items()}
     
     print("\n" + "=" * 70)
     print("INTERACTIVE PROJECT SELECTION")
     print("=" * 70)
-    print("\nType part of a project name to search (or press Enter to finish)")
+    print("\nType project name or ID and press TAB for autocomplete")
     print("Commands:")
-    print("  'all'  - select all projects")
-    print("  'done' - finish selection")
-    print("  'exit' - exit the script")
+    print("  'all'   - select all projects")
+    print("  'list'  - show currently selected projects")
+    print("  'done'  - finish selection")
+    print("  'exit'  - exit the script")
     print("-" * 70)
     
     while True:
         try:
-            search = input("\nSearch (or 'done'/'exit'): ").strip()
+            # Use prompt_toolkit session for tab completion
+            search = session.prompt("\nEnter project (TAB to autocomplete): ").strip()
         except (EOFError, KeyboardInterrupt):
             log("\n[INTERRUPT] Project selection cancelled", "WARN")
             return []
@@ -1958,6 +2034,16 @@ def interactive_project_selection(projects):
             else:
                 log("\n[EXIT] User exited project selection", "INFO")
                 sys.exit(0)
+        
+        # Show list of selected projects
+        if search.lower() == 'list':
+            if selected_ids:
+                print(f"\nCurrently selected projects ({len(selected_ids)}):")
+                for pid in selected_ids:
+                    print(f"  [{pid:>3}] {projects.get(pid, 'Unknown')}")
+            else:
+                print("\nNo projects selected yet.")
+            continue
         
         # Check if user is done selecting
         if search.lower() == 'done':
@@ -1981,45 +2067,34 @@ def interactive_project_selection(projects):
             log(f"Selected all {len(selected_ids)} projects", "INFO")
             break
         
-        # Find matches
-        matches = fuzzy_search_projects(projects, search)
-        
-        if not matches:
-            print(f"No matches found for '{search}'. Try a different search term.")
-            continue
-        
-        # Show matches
-        print(f"\nMatches for '{search}':")
-        for i, (pid, name) in enumerate(matches, 1):
-            status = " [SELECTED]" if pid in selected_ids else ""
-            print(f"  {i:>3}. [{pid:>3}] {name}{status}")
-        
-        # Let user select by number
-        try:
-            selection = input(f"\nSelect number (1-{len(matches)}) or Enter to search again: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            log("\n[INTERRUPT] Project selection cancelled", "WARN")
-            return []
-        
-        if not selection:
-            continue
-        
-        # Parse selection
-        try:
-            sel_num = int(selection)
-            if 1 <= sel_num <= len(matches):
-                selected_pid, selected_name = matches[sel_num - 1]
-                
-                if selected_pid in selected_ids:
-                    print(f"Project '{selected_name}' (ID: {selected_pid}) is already selected.")
+        # Try to match by project ID first
+        if search.isdigit():
+            pid = int(search)
+            if pid in projects:
+                if pid in selected_ids:
+                    print(f"Project '{projects[pid]}' (ID: {pid}) is already selected.")
                 else:
-                    selected_ids.append(selected_pid)
-                    print(f"✓ Added: {selected_name} (ID: {selected_pid})")
+                    selected_ids.append(pid)
+                    print(f"✓ Added: {projects[pid]} (ID: {pid})")
                     print(f"Total selected: {len(selected_ids)} project(s)")
+                continue
             else:
-                print(f"Invalid number. Please enter 1-{len(matches)}.")
-        except ValueError:
-            print("Invalid input. Please enter a number.")
+                print(f"No project found with ID: {pid}")
+                continue
+        
+        # Try to match by exact project name
+        if search in name_to_id:
+            pid = name_to_id[search]
+            if pid in selected_ids:
+                print(f"Project '{search}' (ID: {pid}) is already selected.")
+            else:
+                selected_ids.append(pid)
+                print(f"✓ Added: {search} (ID: {pid})")
+                print(f"Total selected: {len(selected_ids)} project(s)")
+            continue
+        
+        # No match found
+        print(f"No project found matching '{search}'. Try using TAB for autocomplete.")
     
     # Show final selection
     if selected_ids:
@@ -2031,7 +2106,29 @@ def interactive_project_selection(projects):
         print("=" * 70)
     
     return selected_ids
+```
 
+**4. You can now remove the old `fuzzy_search_projects` function as it's no longer needed.**
+
+**How it works:**
+
+1. **Type and Tab**: Start typing a project name or ID, then press TAB to see autocomplete suggestions
+2. **Smart matching**: Matches both project IDs and names (case-insensitive)
+3. **Visual feedback**: Shows `[ID] Project Name` in the completion menu
+4. **Selection**: Press Enter to select the highlighted completion
+
+**Example usage:**
+```
+Enter project (TAB to autocomplete): use
+[Press TAB]
+→ [101] user-authentication-service
+  [105] user-profile-service
+  
+Enter project (TAB to autocomplete): 10
+[Press TAB]
+→ [101] user-authentication-service
+  [102] payment-gateway-api
+  [105] user-profile-service
 
 def parse_project_input(user_input, projects):
     if not user_input or user_input.strip().lower() == 'all':
