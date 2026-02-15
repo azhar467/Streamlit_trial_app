@@ -37,7 +37,7 @@ SOURCE_BRANCH = "develop"
 MR_TITLE = f"TASK-{JIRA_ID}: java migration"
 
 TARGET_PARENT_VERSION = "1.8.3"
-NEW_DEFAULT_PLATFORM = "arn:aws:elasticbeanstalk:us-east-1::platform/Corretto 17 running on 64bit Amazon Linux 2/3.10.3"
+NEW_DEFAULT_PLATFORM = ""
 
 AUTO_ROLLBACK_ON_FAILURE = True
 
@@ -135,7 +135,7 @@ def create_rollback_snapshot(pid, p_name, branch_name, files_to_backup):
         else:
             snapshot['commit_sha'] = None
     except Exception as e:
-        log(f"Could not get branch head for rollback snapshot: {e}", "WARN")
+        log(f"[{p_name}] Could not get branch head for rollback snapshot: {e}", "WARN")
         snapshot['commit_sha'] = None
     
     for file_path in files_to_backup:
@@ -155,7 +155,7 @@ def create_rollback_snapshot(pid, p_name, branch_name, files_to_backup):
                     'exists': False
                 }
         except Exception as e:
-            log(f"Could not backup {file_path} for rollback: {e}", "WARN")
+            log(f"[{p_name}] Could not backup {file_path} for rollback: {e}", "WARN")
             snapshot['files'][file_path] = {
                 'content': None,
                 'exists': False,
@@ -224,17 +224,17 @@ def perform_rollback(rollback_file):
         p_name = snapshot['project_name']
         branch = snapshot['branch']
         
-        log(f"\n--- Rollback: {p_name} (ID: {pid}) ---", "INFO")
+        log(f"\n--- Rollback: {p_name} ---", "INFO")
         
         project_success = True
         for file_path, file_data in snapshot.get('files', {}).items():
             if not file_data.get('exists'):
-                log(f"File {file_path} did not exist before, skipping restore", "INFO")
+                log(f"[{p_name}] File {file_path} did not exist before, skipping restore", "INFO")
                 continue
             
             content = file_data.get('content')
             if content is None:
-                log(f"No backup content for {file_path}, skipping", "WARN")
+                log(f"[{p_name}] No backup content for {file_path}, skipping", "WARN")
                 continue
             
             try:
@@ -249,18 +249,18 @@ def perform_rollback(rollback_file):
                 }
                 
                 api_call(f"projects/{pid}/repository/commits", "POST", commit_data)
-                log(f"Restored {file_path}", "INFO")
+                log(f"[{p_name}] Restored {file_path}", "INFO")
                 
             except Exception as e:
-                log(f"Error restoring {file_path}: {e}", "ERROR")
+                log(f"[{p_name}] Error restoring {file_path}: {e}", "ERROR")
                 project_success = False
         
         if project_success:
             success_count += 1
-            log(f"Rollback completed successfully for {p_name}", "INFO")
+            log(f"[{p_name}] Rollback completed successfully", "INFO")
         else:
             fail_count += 1
-            log(f"Rollback completed with errors for {p_name}", "WARN")
+            log(f"[{p_name}] Rollback completed with errors", "WARN")
     
     log("\n" + "=" * 70, "INFO")
     log(f"ROLLBACK COMPLETE: {success_count} successful, {fail_count} with errors", "INFO")
@@ -280,7 +280,7 @@ def log(msg, level="INFO"):
 
 
 def load_config_from_env(debug=False):
-    global ASSIGNEE_EMAIL, REVIEWER_EMAILS
+    global ASSIGNEE_EMAIL, REVIEWER_EMAILS, NEW_DEFAULT_PLATFORM
     
     script_dir = os.path.dirname(os.path.abspath(__file__))
     env_file = os.path.join(script_dir, '.env')
@@ -321,6 +321,11 @@ def load_config_from_env(debug=False):
                             REVIEWER_EMAILS = emails
                             if debug:
                                 log(f"Loaded REVIEWER_EMAILS: {emails}", "DEBUG")
+                        
+                        elif key == 'NEW_DEFAULT_PLATFORM':
+                            NEW_DEFAULT_PLATFORM = value
+                            if debug:
+                                log(f"Loaded NEW_DEFAULT_PLATFORM: {value[:50]}...", "DEBUG")
                     
                     except (ValueError, IndexError) as e:
                         log(f"Error parsing config line {i}: {line} ({e})", "WARN")
@@ -819,26 +824,49 @@ def prompt_yes_no(prompt, default=False):
     return ans in ("y", "yes")
 
 
+def verify_branch_exists(pid, branch_name):
+    try:
+        br_check = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(branch_name, safe='')}")
+        if isinstance(br_check, dict) and "name" in br_check:
+            return True
+        return False
+    except Exception as e:
+        log(f"Error checking branch {branch_name}: {e}", "DEBUG")
+        return False
+
+
+def list_repository_tree(pid, p_name, branch_ref, path=''):
+    try:
+        quoted_path = urllib.parse.quote(path, safe='')
+        tree = api_call(f"projects/{pid}/repository/tree?ref={urllib.parse.quote(branch_ref, safe='')}&path={quoted_path}&per_page=100")
+        if isinstance(tree, list):
+            return tree
+        return []
+    except Exception as e:
+        log(f"[{p_name}] Error listing repository tree: {e}", "ERROR")
+        return []
+
+
 def create_feature_branch(pid, p_name):
     try:
-        log(f"Creating feature branch '{FEATURE_BRANCH}' from '{SOURCE_BRANCH}' for project {p_name}...", "INFO")
+        log(f"[{p_name}] Creating feature branch '{FEATURE_BRANCH}' from '{SOURCE_BRANCH}'...", "INFO")
         result = api_call(f"projects/{pid}/repository/branches", "POST", 
                          {"branch": FEATURE_BRANCH, "ref": SOURCE_BRANCH})
         
         if isinstance(result, dict) and not result.get("error"):
-            log(f"[SUCCESS] Feature branch '{FEATURE_BRANCH}' created successfully for {p_name}", "INFO")
+            log(f"[{p_name}] Feature branch '{FEATURE_BRANCH}' created successfully", "INFO")
             return True
         else:
             error_detail = result.get('details', 'unknown error') if isinstance(result, dict) else 'unknown error'
-            log(f"[ERROR] Failed to create feature branch '{FEATURE_BRANCH}' for {p_name}: {error_detail}", "ERROR")
+            log(f"[{p_name}] Failed to create feature branch '{FEATURE_BRANCH}': {error_detail}", "ERROR")
             
             if "already exists" in str(error_detail).lower():
-                log(f"[INFO] Branch '{FEATURE_BRANCH}' already exists for {p_name}, will use existing branch", "INFO")
+                log(f"[{p_name}] Branch '{FEATURE_BRANCH}' already exists, will use existing branch", "INFO")
                 return True
             
             return False
     except Exception as e:
-        log(f"[ERROR] Exception while creating feature branch for {p_name}: {e}", "ERROR")
+        log(f"[{p_name}] Exception while creating feature branch: {e}", "ERROR")
         return False
 
 
@@ -847,9 +875,11 @@ def fetch_tags_for_project(pid, per_page=100, page=1):
     return api_call(endpoint)
 
 
-def fetch_all_tags_for_project(pid, per_page=100):
+def fetch_all_tags_for_project(pid, p_name):
     page = 1
     all_tags = []
+    per_page = 100
+    
     while True:
         try:
             resp = fetch_tags_for_project(pid, per_page=per_page, page=page)
@@ -867,7 +897,7 @@ def fetch_all_tags_for_project(pid, per_page=100):
     for tag in all_tags:
         if isinstance(tag, dict) and tag.get('protected'):
             tag_name = tag.get('name', 'unknown')
-            log(f"Tag '{tag_name}' is PROTECTED", "WARN")
+            log(f"[{p_name}] Tag '{tag_name}' is PROTECTED", "WARN")
     
     return all_tags
 
@@ -955,7 +985,7 @@ def find_parent_version_in_pom(content):
     return None
 
 
-def check_files_already_match(pid, actions, branch_ref):
+def check_files_already_match(pid, p_name, actions, branch_ref):
     all_match = True
     details = []
     
@@ -983,7 +1013,7 @@ def check_files_already_match(pid, actions, branch_ref):
     return all_match, details
 
 
-def get_file_metadata(pid, file_path, branch_ref):
+def get_file_metadata(pid, p_name, file_path, branch_ref):
     quoted_path = urllib.parse.quote(file_path, safe='')
     
     try:
@@ -1007,17 +1037,17 @@ def get_file_metadata(pid, file_path, branch_ref):
                         metadata['last_modified_by'] = commit_info.get('author_name', 'unknown')
                         metadata['commit_message'] = commit_info.get('message', 'unknown').split('\n')[0]
                 except Exception as e:
-                    log(f"Could not fetch commit details for {file_path}: {e}", "DEBUG")
+                    log(f"[{p_name}] Could not fetch commit details for {file_path}: {e}", "DEBUG")
             
             return metadata
         else:
             return None
     except Exception as e:
-        log(f"Error getting metadata for {file_path}: {e}", "DEBUG")
+        log(f"[{p_name}] Error getting metadata for {file_path}: {e}", "DEBUG")
         return None
 
 
-def detect_conflicts(pid, file_path, base_content, our_content, remote_ref):
+def detect_conflicts(pid, p_name, file_path, base_content, our_content, remote_ref):
     quoted_path = urllib.parse.quote(file_path, safe='')
     remote_res = api_call(f"projects/{pid}/repository/files/{quoted_path}?ref={urllib.parse.quote(remote_ref, safe='')}")
     
@@ -1033,7 +1063,7 @@ def detect_conflicts(pid, file_path, base_content, our_content, remote_ref):
         return None
     
     if remote_content == our_content:
-        log(f"Remote {file_path} already contains our changes.", "INFO")
+        log(f"[{p_name}] Remote {file_path} already contains our changes", "INFO")
         return {"type": "already_applied", "file": file_path}
     
     base_lines = base_content.splitlines(keepends=True)
@@ -1110,25 +1140,25 @@ def handle_conflict(conflict_info, pid, p_name):
     file_path = conflict_info['file']
     
     if conflict_info['type'] == 'already_applied':
-        log(f"File {file_path} already has our changes on remote. Skipping.", "INFO")
+        log(f"[{p_name}] File {file_path} already has our changes on remote. Skipping", "INFO")
         return "skip"
     
     if conflict_info['type'] == 'non_overlapping':
-        log(f"File {file_path} has non-overlapping changes. Attempting automatic merge...", "INFO")
+        log(f"[{p_name}] File {file_path} has non-overlapping changes. Attempting automatic merge...", "INFO")
         merged = attempt_three_way_merge(
             conflict_info['base_content'],
             conflict_info['our_content'],
             conflict_info['remote_content']
         )
         if merged:
-            log(f"Successfully merged {file_path}.", "INFO")
+            log(f"[{p_name}] Successfully merged {file_path}", "INFO")
             return merged
         else:
-            log(f"Automatic merge failed for {file_path}.", "WARN")
+            log(f"[{p_name}] Automatic merge failed for {file_path}", "WARN")
     
     if conflict_info['type'] == 'conflict':
         print(f"\n{'='*80}")
-        print(f"CONFLICT DETECTED in {file_path}")
+        print(f"[{p_name}] CONFLICT DETECTED in {file_path}")
         print(f"{'='*80}")
         print(f"Remote branch has changes that conflict with your local changes.")
         print(f"Overlapping line numbers: {conflict_info.get('overlapping_lines', 'unknown')}")
@@ -1138,7 +1168,7 @@ def handle_conflict(conflict_info, pid, p_name):
         print(show_unified_diff(file_path, conflict_info['base_content'], conflict_info['remote_content']))
         print(f"{'='*80}\n")
     
-    print(f"\nConflict resolution options for {file_path}:")
+    print(f"\n[{p_name}] Conflict resolution options for {file_path}:")
     print("  1. Use our version (overwrite remote changes)")
     print("  2. Use remote version (discard our changes)")
     print("  3. Skip this file")
@@ -1148,20 +1178,20 @@ def handle_conflict(conflict_info, pid, p_name):
         try:
             choice = input("Choose [1/2/3/4]: ").strip()
         except (EOFError, KeyboardInterrupt):
-            log("\n[INTERRUPT] User interrupted conflict resolution", "WARN")
+            log(f"[{p_name}] User interrupted conflict resolution", "WARN")
             raise Exception("User interrupted during conflict resolution")
         
         if choice == '1':
-            log(f"Using our version for {file_path}", "INFO")
+            log(f"[{p_name}] Using our version for {file_path}", "INFO")
             return "ours"
         elif choice == '2':
-            log(f"Using remote version for {file_path}", "INFO")
+            log(f"[{p_name}] Using remote version for {file_path}", "INFO")
             return "theirs"
         elif choice == '3':
-            log(f"Skipping {file_path}", "INFO")
+            log(f"[{p_name}] Skipping {file_path}", "INFO")
             return "skip"
         elif choice == '4':
-            log(f"Aborting operation for project {p_name}", "WARN")
+            log(f"[{p_name}] Aborting operation", "WARN")
             raise Exception("User aborted due to conflict")
         else:
             print("Invalid choice. Please enter 1, 2, 3, or 4.")
@@ -1170,23 +1200,23 @@ def handle_conflict(conflict_info, pid, p_name):
 def create_mr_for_project(pid, p_name, rollback_data):
     global ASSIGNEE_USER_ID, REVIEWER_USER_IDS
     
-    log(f"--- Creating MR for: {p_name} (project id: {pid}) ---", "INFO")
+    log(f"--- Creating MR for: {p_name} ---", "INFO")
     
     if INTERRUPTED:
-        log("MR creation interrupted", "WARN")
+        log(f"[{p_name}] MR creation interrupted", "WARN")
         return {'success': False, 'idempotent': False, 'url': None}
     
     br_check = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
     
     if not (isinstance(br_check, dict) and "name" in br_check):
-        log(f"Feature branch '{FEATURE_BRANCH}' does not exist for {p_name}. Creating it...", "WARN")
+        log(f"[{p_name}] Feature branch '{FEATURE_BRANCH}' does not exist. Creating it...", "WARN")
         branch_created = create_feature_branch(pid, p_name)
         if not branch_created:
-            log(f"[ERROR] Cannot create MR without feature branch for {p_name}", "ERROR")
+            log(f"[{p_name}] Cannot create MR without feature branch", "ERROR")
             return {'success': False, 'idempotent': False, 'url': None}
         br_check = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
     
-    log(f"Checking if MR already exists for {FEATURE_BRANCH}...", "INFO")
+    log(f"[{p_name}] Checking if MR already exists for {FEATURE_BRANCH}...", "INFO")
     try:
         existing = api_call(f"projects/{pid}/merge_requests?state=opened&source_branch={urllib.parse.quote(FEATURE_BRANCH, safe='')}")
     except Exception as e:
@@ -1194,19 +1224,19 @@ def create_mr_for_project(pid, p_name, rollback_data):
 
     has_open_mr = isinstance(existing, list) and len(existing) > 0
     if isinstance(existing, dict) and existing.get("error"):
-        log(f"Could not verify existing MRs for {p_name}: {existing.get('details')}", "ERROR")
+        log(f"[{p_name}] Could not verify existing MRs: {existing.get('details')}", "ERROR")
         return {'success': False, 'idempotent': False, 'url': None}
 
     if has_open_mr:
         try:
             existing_url = existing[0].get('web_url', 'unknown')
-            log(f"[IDEMPOTENT] MR already exists: {existing_url}", "INFO")
+            log(f"[{p_name}] MR already exists: {existing_url}", "INFO")
             return {'success': True, 'idempotent': True, 'url': existing_url}
         except Exception:
-            log("[IDEMPOTENT] MR already exists (could not parse response).", "INFO")
+            log(f"[{p_name}] MR already exists (could not parse response)", "INFO")
             return {'success': True, 'idempotent': True, 'url': None}
     
-    log(f"Creating new MR for {p_name}...", "INFO")
+    log(f"[{p_name}] Creating new MR...", "INFO")
     mr_payload = {
         "source_branch": FEATURE_BRANCH,
         "target_branch": SOURCE_BRANCH,
@@ -1215,25 +1245,25 @@ def create_mr_for_project(pid, p_name, rollback_data):
     
     if ASSIGNEE_USER_ID:
         mr_payload["assignee_ids"] = [ASSIGNEE_USER_ID]
-        log(f"Setting MR assignee (ID: {ASSIGNEE_USER_ID})", "DEBUG")
+        log(f"[{p_name}] Setting MR assignee (ID: {ASSIGNEE_USER_ID})", "DEBUG")
     
     if REVIEWER_USER_IDS and len(REVIEWER_USER_IDS) > 0:
         mr_payload["reviewer_ids"] = REVIEWER_USER_IDS
         reviewer_ids_str = ", ".join([str(r) for r in REVIEWER_USER_IDS])
-        log(f"Setting MR reviewers (IDs: {reviewer_ids_str})", "DEBUG")
+        log(f"[{p_name}] Setting MR reviewers (IDs: {reviewer_ids_str})", "DEBUG")
     
     mr_result = api_call(f"projects/{pid}/merge_requests", "POST", mr_payload)
     
     if isinstance(mr_result, dict) and not mr_result.get("error"):
         mr_url = mr_result.get('web_url', 'N/A')
-        log(f"[SUCCESS] MR created: {mr_url}", "INFO")
+        log(f"[{p_name}] MR created successfully: {mr_url}", "INFO")
         if ASSIGNEE_USER_ID:
-            log(f"  Assignee: ID {ASSIGNEE_USER_ID}", "INFO")
+            log(f"[{p_name}] Assignee: ID {ASSIGNEE_USER_ID}", "INFO")
         if REVIEWER_USER_IDS and len(REVIEWER_USER_IDS) > 0:
-            log(f"  Reviewers: {len(REVIEWER_USER_IDS)} reviewer(s) assigned", "INFO")
+            log(f"[{p_name}] Reviewers: {len(REVIEWER_USER_IDS)} reviewer(s) assigned", "INFO")
         return {'success': True, 'idempotent': False, 'url': mr_url}
     else:
-        log(f"[ERROR] Failed to create MR: {mr_result.get('details', 'unknown error')}", "ERROR")
+        log(f"[{p_name}] Failed to create MR: {mr_result.get('details', 'unknown error')}", "ERROR")
         return {'success': False, 'idempotent': False, 'url': None}
 
 
@@ -1246,7 +1276,7 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
     
     project_info = api_call(f"projects/{pid}")
     p_name = project_info.get('name', f"ID:{pid}") if isinstance(project_info, dict) else f"ID:{pid}"
-    log(f"--- Processing: {p_name} (project id: {pid}) ---", "INFO")
+    log(f"--- Processing: {p_name} ---", "INFO")
     
     result = {
         'project_id': pid,
@@ -1279,19 +1309,44 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
             return result
         
         actions = []
-        br_check = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
-        current_ref = FEATURE_BRANCH if isinstance(br_check, dict) and "name" in br_check else SOURCE_BRANCH
+        
+        log(f"[{p_name}] Checking if feature branch '{FEATURE_BRANCH}' exists...", "DEBUG")
+        feature_exists = verify_branch_exists(pid, FEATURE_BRANCH)
+        
+        if feature_exists:
+            current_ref = FEATURE_BRANCH
+            log(f"[{p_name}] Using existing feature branch: {FEATURE_BRANCH}", "INFO")
+        else:
+            log(f"[{p_name}] Feature branch '{FEATURE_BRANCH}' does not exist, using source branch: {SOURCE_BRANCH}", "INFO")
+            source_exists = verify_branch_exists(pid, SOURCE_BRANCH)
+            
+            if not source_exists:
+                log(f"[{p_name}] Source branch '{SOURCE_BRANCH}' does not exist!", "ERROR")
+                result['error'] = f"Source branch '{SOURCE_BRANCH}' not found"
+                if state is not None:
+                    state['failed_projects'].append(pid)
+                    save_state(state)
+                return result
+            
+            current_ref = SOURCE_BRANCH
         
         if mode == 'full' and choices:
             if INTERRUPTED:
-                log("Interrupted during file preparation", "WARN")
+                log(f"[{p_name}] Interrupted during file preparation", "WARN")
                 result['interrupted'] = True
                 return result
             
+            log(f"[{p_name}] Using branch reference: {current_ref}", "INFO")
+            
             if '1' in choices:
+                log(f"[{p_name}] Fetching pom.xml from {current_ref}...", "DEBUG")
                 res = api_call(f"projects/{pid}/repository/files/{urllib.parse.quote('pom.xml', safe='')}?ref={urllib.parse.quote(current_ref, safe='')}")
                 if isinstance(res, dict) and res.get("error"):
-                    log(f"Failed to fetch pom.xml for {p_name}: {res.get('details')}", "ERROR")
+                    error_detail = res.get('details', 'unknown error')
+                    if '404' in str(error_detail):
+                        log(f"[{p_name}] pom.xml not found on branch {current_ref}, skipping POM changes", "WARN")
+                    else:
+                        log(f"[{p_name}] Failed to fetch pom.xml: {error_detail}", "ERROR")
                 elif "content" in res:
                     orig = base64.b64decode(res['content']).decode('utf-8')
                     upd = re.sub(r"<(java\.version|maven\.compiler\.(source|target|release))>11</\1>", r"<\1>17</\1>", orig)
@@ -1299,36 +1354,66 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
                         upd = re.sub(r"<parent>[\s\S]*?</parent>", update_parent_block, upd)
                     if orig != upd:
                         actions.append({"action": "update", "file_path": "pom.xml", "content": upd, "old_content": orig})
+                        log(f"[{p_name}] pom.xml changes prepared", "DEBUG")
+                    else:
+                        log(f"[{p_name}] pom.xml requires no changes", "DEBUG")
+                else:
+                    log(f"[{p_name}] pom.xml not found or empty response", "WARN")
 
             if '2' in choices:
+                log(f"[{p_name}] Fetching .gitlab-ci.yml from {current_ref}...", "DEBUG")
                 res = api_call(f"projects/{pid}/repository/files/{urllib.parse.quote('.gitlab-ci.yml', safe='')}?ref={urllib.parse.quote(current_ref, safe='')}")
                 if isinstance(res, dict) and res.get("error"):
-                    log(f"Failed to fetch .gitlab-ci.yml for {p_name}: {res.get('details')}", "ERROR")
+                    error_detail = res.get('details', 'unknown error')
+                    if '404' in str(error_detail):
+                        log(f"[{p_name}] .gitlab-ci.yml not found on branch {current_ref}, skipping CI changes", "WARN")
+                    else:
+                        log(f"[{p_name}] Failed to fetch .gitlab-ci.yml: {error_detail}", "ERROR")
                 elif "content" in res:
                     orig = base64.b64decode(res['content']).decode('utf-8')
                     upd = re.sub(r"^\s*image:.*(\n|$)", "", orig, flags=re.MULTILINE)
                     if orig != upd:
                         actions.append({"action": "update", "file_path": ".gitlab-ci.yml", "content": upd, "old_content": orig})
+                        log(f"[{p_name}] .gitlab-ci.yml changes prepared", "DEBUG")
+                    else:
+                        log(f"[{p_name}] .gitlab-ci.yml requires no changes", "DEBUG")
+                else:
+                    log(f"[{p_name}] .gitlab-ci.yml not found or empty response", "WARN")
 
             if '3' in choices:
+                log(f"[{p_name}] Fetching .elasticbeanstalk/config.yml from {current_ref}...", "DEBUG")
                 path = urllib.parse.quote(".elasticbeanstalk/config.yml", safe='')
                 res = api_call(f"projects/{pid}/repository/files/{path}?ref={urllib.parse.quote(current_ref, safe='')}")
                 if isinstance(res, dict) and res.get("error"):
-                    log(f"Failed to fetch .elasticbeanstalk/config.yml for {p_name}: {res.get('details')}", "ERROR")
+                    error_detail = res.get('details', 'unknown error')
+                    if '404' in str(error_detail):
+                        log(f"[{p_name}] .elasticbeanstalk/config.yml not found on branch {current_ref}, skipping EB changes", "WARN")
+                    else:
+                        log(f"[{p_name}] Failed to fetch .elasticbeanstalk/config.yml: {error_detail}", "ERROR")
                 elif "content" in res:
                     orig = base64.b64decode(res['content']).decode('utf-8')
-                    upd = re.sub(r"(default_platform:\s*).*$", f"default_platform: {NEW_DEFAULT_PLATFORM}", orig, flags=re.MULTILINE)
+                    if NEW_DEFAULT_PLATFORM:
+                        upd = re.sub(r"(default_platform:\s*).*$", f"default_platform: {NEW_DEFAULT_PLATFORM}", orig, flags=re.MULTILINE)
+                    else:
+                        log(f"[{p_name}] NEW_DEFAULT_PLATFORM not configured in .env, skipping platform update", "WARN")
+                        upd = orig
+                    
                     if orig != upd:
                         actions.append({"action": "update", "file_path": ".elasticbeanstalk/config.yml", "content": upd, "old_content": orig})
+                        log(f"[{p_name}] .elasticbeanstalk/config.yml changes prepared", "DEBUG")
+                    else:
+                        log(f"[{p_name}] .elasticbeanstalk/config.yml requires no changes", "DEBUG")
+                else:
+                    log(f"[{p_name}] .elasticbeanstalk/config.yml not found or empty response", "WARN")
 
             if actions:
                 print(f"\n{'='*70}")
                 print(f"PREVIEW: Proposed changes for {p_name}")
                 print(f"{'='*70}")
                 
-                log("Fetching file metadata...", "INFO")
+                log(f"[{p_name}] Fetching file metadata...", "INFO")
                 for action in actions:
-                    metadata = get_file_metadata(pid, action['file_path'], current_ref)
+                    metadata = get_file_metadata(pid, p_name, action['file_path'], current_ref)
                     if metadata:
                         print(f"\nFile: {action['file_path']}")
                         print(f"   Last modified by: {metadata['last_modified_by']}")
@@ -1358,14 +1443,14 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
                 print(f"{'='*70}\n")
                 
                 if not prompt_yes_no(f"Commit these changes for {p_name}?", default=True):
-                    log(f"User skipped commit for {p_name}", "INFO")
+                    log(f"[{p_name}] User skipped commit", "INFO")
                     if state is not None:
                         state['skipped_projects'].append(pid)
                         save_state(state)
                     return result
                 
                 if INTERRUPTED:
-                    log("Interrupted before commit", "WARN")
+                    log(f"[{p_name}] Interrupted before commit", "WARN")
                     result['interrupted'] = True
                     return result
                 
@@ -1373,12 +1458,12 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
                     files_to_backup = [action['file_path'] for action in actions]
                     snapshot = create_rollback_snapshot(pid, p_name, current_ref, files_to_backup)
                     rollback_data['snapshots'].append(snapshot)
-                    log(f"Created rollback snapshot for {p_name}", "DEBUG")
+                    log(f"[{p_name}] Created rollback snapshot", "DEBUG")
                 
-                if not (isinstance(br_check, dict) and "name" in br_check):
+                if not feature_exists:
                     branch_created = create_feature_branch(pid, p_name)
                     if not branch_created:
-                        log(f"[ERROR] Cannot proceed without feature branch for {p_name}", "ERROR")
+                        log(f"[{p_name}] Cannot proceed without feature branch", "ERROR")
                         result['error'] = "Failed to create feature branch"
                         
                         if state is not None:
@@ -1387,7 +1472,7 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
                         
                         return result
                 
-                log(f"Checking for conflicts on {FEATURE_BRANCH}...", "INFO")
+                log(f"[{p_name}] Checking for conflicts on {FEATURE_BRANCH}...", "INFO")
                 conflicts_detected = []
                 
                 for act in actions:
@@ -1395,12 +1480,12 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
                     base_content = act['old_content']
                     our_content = act['content']
                     
-                    conflict = detect_conflicts(pid, file_path, base_content, our_content, FEATURE_BRANCH)
+                    conflict = detect_conflicts(pid, p_name, file_path, base_content, our_content, FEATURE_BRANCH)
                     if conflict:
                         conflicts_detected.append((act, conflict))
                 
                 if conflicts_detected:
-                    log(f"Found {len(conflicts_detected)} file(s) with potential conflicts.", "WARN")
+                    log(f"[{p_name}] Found {len(conflicts_detected)} file(s) with potential conflicts", "WARN")
                     
                     for act, conflict in conflicts_detected:
                         try:
@@ -1418,7 +1503,7 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
                                         a['content'] = resolution
                                         break
                         except Exception as e:
-                            log(f"Conflict handling aborted: {e}", "ERROR")
+                            log(f"[{p_name}] Conflict handling aborted: {e}", "ERROR")
                             result['error'] = str(e)
                             
                             if state is not None:
@@ -1427,26 +1512,26 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
                             
                             return result
                 else:
-                    log("No conflicts detected.", "INFO")
+                    log(f"[{p_name}] No conflicts detected", "INFO")
                 
                 if not actions:
-                    log(f"No remaining changes to commit for {p_name} after conflict resolution.", "INFO")
+                    log(f"[{p_name}] No remaining changes to commit after conflict resolution", "INFO")
                 else:
-                    log(f"Checking if changes already exist on {FEATURE_BRANCH}...", "INFO")
-                    files_already_match, match_details = check_files_already_match(pid, actions, FEATURE_BRANCH)
+                    log(f"[{p_name}] Checking if changes already exist on {FEATURE_BRANCH}...", "INFO")
+                    files_already_match, match_details = check_files_already_match(pid, p_name, actions, FEATURE_BRANCH)
                     
                     if files_already_match:
-                        log(f"[IDEMPOTENT] All files already match desired state on {FEATURE_BRANCH}. Skipping commit.", "INFO")
+                        log(f"[{p_name}] All files already match desired state on {FEATURE_BRANCH}. Skipping commit", "INFO")
                         for detail in match_details:
                             if detail['match']:
-                                log(f"  File {detail['file']} already matches", "DEBUG")
+                                log(f"[{p_name}] File {detail['file']} already matches", "DEBUG")
                         result['committed'] = True
                         result['idempotent_commit'] = True
                     else:
-                        log(f"Files need updating on {FEATURE_BRANCH}:", "INFO")
+                        log(f"[{p_name}] Files need updating on {FEATURE_BRANCH}", "INFO")
                         for detail in match_details:
                             if not detail['match']:
-                                log(f"  File {detail['file']}: {detail.get('reason', 'needs update')}", "DEBUG")
+                                log(f"[{p_name}] File {detail['file']}: {detail.get('reason', 'needs update')}", "DEBUG")
                         
                         commit_payload = {
                             "branch": FEATURE_BRANCH,
@@ -1456,14 +1541,14 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
                         commit_resp = api_call(f"projects/{pid}/repository/commits", "POST", commit_payload)
                         
                         if isinstance(commit_resp, dict) and not commit_resp.get("error"):
-                            log(f"[SUCCESS] Changes committed for {p_name}", "INFO")
+                            log(f"[{p_name}] Changes committed successfully", "INFO")
                             result['committed'] = True
                         else:
-                            log(f"[ERROR] Failed to commit changes: {commit_resp.get('details', 'unknown')}", "ERROR")
+                            log(f"[{p_name}] Failed to commit changes: {commit_resp.get('details', 'unknown')}", "ERROR")
                             result['error'] = "Commit failed"
                             
                             if AUTO_ROLLBACK_ON_FAILURE and rollback_data and rollback_data.get('snapshots'):
-                                log(f"[AUTO-ROLLBACK] Rolling back changes for {p_name}...", "WARN")
+                                log(f"[{p_name}] AUTO-ROLLBACK: Rolling back changes...", "WARN")
                                 rollback_file = save_rollback_data(rollback_data)
                                 perform_rollback(rollback_file)
                             
@@ -1473,10 +1558,10 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
                             
                             return result
             else:
-                log(f"No file changes needed for {p_name}", "INFO")
+                log(f"[{p_name}] No file changes needed", "INFO")
         
         if INTERRUPTED:
-            log("Interrupted before next step selection", "WARN")
+            log(f"[{p_name}] Interrupted before next step selection", "WARN")
             result['interrupted'] = True
             return result
         
@@ -1491,7 +1576,7 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
             try:
                 choice = input("Choose [1/2/3] (default: 1): ").strip()
             except (EOFError, KeyboardInterrupt):
-                log("\n[INTERRUPT] User interrupted next step selection", "WARN")
+                log(f"[{p_name}] User interrupted next step selection", "WARN")
                 result['interrupted'] = True
                 return result
             
@@ -1502,7 +1587,7 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
                 result['success'] = result['committed'] or mr_result['success']
                 
             elif choice == '3':
-                log(f"Skipping deployment/MR for {p_name}", "INFO")
+                log(f"[{p_name}] Skipping deployment/MR", "INFO")
                 result['success'] = result['committed']
                 
             else:
@@ -1524,18 +1609,18 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
         seconds = int(project_duration % 60)
         
         if minutes > 0:
-            log(f"[COMPLETE] Completed {p_name} in {minutes}m {seconds}s", "INFO")
+            log(f"[{p_name}] Completed in {minutes}m {seconds}s", "INFO")
         else:
-            log(f"[COMPLETE] Completed {p_name} in {seconds}s", "INFO")
+            log(f"[{p_name}] Completed in {seconds}s", "INFO")
         
         return result
         
     except Exception as e:
-        log(f"[ERROR] Exception processing {p_name}: {e}", "ERROR")
+        log(f"[{p_name}] Exception processing project: {e}", "ERROR")
         result['error'] = str(e)
         
         if AUTO_ROLLBACK_ON_FAILURE and rollback_data and rollback_data.get('snapshots'):
-            log(f"[AUTO-ROLLBACK] Rolling back changes for {p_name}...", "WARN")
+            log(f"[{p_name}] AUTO-ROLLBACK: Rolling back changes...", "WARN")
             rollback_file = save_rollback_data(rollback_data)
             perform_rollback(rollback_file)
         
@@ -1547,15 +1632,15 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
 
 
 def handle_deployment(pid, p_name, state=None):
-    log(f"Starting deployment for {p_name}...", "INFO")
+    log(f"[{p_name}] Starting deployment...", "INFO")
     
     if INTERRUPTED:
-        log("Deployment interrupted", "WARN")
+        log(f"[{p_name}] Deployment interrupted", "WARN")
         return {'success': False, 'idempotent_tags': []}
     
-    tags_resp = fetch_all_tags_for_project(pid)
+    tags_resp = fetch_all_tags_for_project(pid, p_name)
     if isinstance(tags_resp, dict) and tags_resp.get("error"):
-        log(f"Could not fetch tags for project {p_name}: {tags_resp.get('details')}", "ERROR")
+        log(f"[{p_name}] Could not fetch tags: {tags_resp.get('details')}", "ERROR")
         return {'success': False, 'idempotent_tags': []}
 
     available_tags_all = tags_resp if isinstance(tags_resp, list) else []
@@ -1563,24 +1648,24 @@ def handle_deployment(pid, p_name, state=None):
     filter_result = filter_and_sort_deployment_tags(available_tags_all)
     
     if isinstance(filter_result, dict) and filter_result.get("error"):
-        log(f"Error filtering tags: {filter_result.get('details')}", "ERROR")
+        log(f"[{p_name}] Error filtering tags: {filter_result.get('details')}", "ERROR")
         return {'success': False, 'idempotent_tags': []}
     
     available_tags = filter_result['sorted_tags']
     found_categories = filter_result['found_categories']
     missing_categories = filter_result['missing_categories']
     
-    log(f"Deployment tags found for {p_name}:", "INFO")
+    log(f"[{p_name}] Deployment tags found:", "INFO")
     if found_categories:
         for category, tag_names in found_categories.items():
-            log(f"  {category.upper()}: {', '.join(tag_names)}", "INFO")
+            log(f"[{p_name}]   {category.upper()}: {', '.join(tag_names)}", "INFO")
     
     if missing_categories:
         for category in missing_categories:
-            log(f"  {category.upper()}: NOT FOUND", "WARN")
+            log(f"[{p_name}]   {category.upper()}: NOT FOUND", "WARN")
     
     if not available_tags:
-        log(f"No deployment tags found for {p_name}. Skipping deployment.", "WARN")
+        log(f"[{p_name}] No deployment tags found. Skipping deployment", "WARN")
         return {'success': False, 'idempotent_tags': []}
     
     print(f"\nAvailable deployment tags for {p_name}:")
@@ -1592,27 +1677,27 @@ def handle_deployment(pid, p_name, state=None):
     try:
         sel = input("Select tags to deploy (e.g. '1' or 'dev' or 'all'): ").strip()
     except (EOFError, KeyboardInterrupt):
-        log("\n[INTERRUPT] User interrupted tag selection", "WARN")
+        log(f"[{p_name}] User interrupted tag selection", "WARN")
         return {'success': False, 'idempotent_tags': []}
     
     selected_tag_names = parse_tag_selection_input(sel, available_tags)
     
     if not selected_tag_names:
-        log("No tags selected; skipping deployment.", "INFO")
+        log(f"[{p_name}] No tags selected; skipping deployment", "INFO")
         return {'success': False, 'idempotent_tags': []}
     
     if state and str(pid) in state.get('project_details', {}):
         completed_tags = state['project_details'][str(pid)].get('completed_tags', [])
         if completed_tags:
-            log(f"Found {len(completed_tags)} already completed tag(s) for this project: {', '.join(completed_tags)}", "INFO")
+            log(f"[{p_name}] Found {len(completed_tags)} already completed tag(s): {', '.join(completed_tags)}", "INFO")
             original_count = len(selected_tag_names)
             selected_tag_names = [tag for tag in selected_tag_names if tag not in completed_tags]
             skipped_count = original_count - len(selected_tag_names)
             if skipped_count > 0:
-                log(f"Skipping {skipped_count} already completed tag(s) from selection", "INFO")
+                log(f"[{p_name}] Skipping {skipped_count} already completed tag(s) from selection", "INFO")
             
             if not selected_tag_names:
-                log("All selected tags already completed. Nothing to do.", "INFO")
+                log(f"[{p_name}] All selected tags already completed. Nothing to do", "INFO")
                 return {'success': True, 'idempotent_tags': completed_tags}
     
     branch_info = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
@@ -1625,85 +1710,85 @@ def handle_deployment(pid, p_name, state=None):
     
     for tag_name in selected_tag_names:
         if INTERRUPTED:
-            log("Deployment interrupted during tag processing", "WARN")
+            log(f"[{p_name}] Deployment interrupted during tag processing", "WARN")
             break
         
-        log(f"\nProcessing tag: {tag_name}", "INFO")
+        log(f"[{p_name}] Processing tag: {tag_name}", "INFO")
         
         quoted_tag = urllib.parse.quote(tag_name, safe='')
         tag_obj = next((t for t in available_tags_all if isinstance(t, dict) and t.get('name') == tag_name), None)
         
         if tag_obj and tag_obj.get('protected'):
-            log(f"Skipping PROTECTED tag '{tag_name}'", "ERROR")
+            log(f"[{p_name}] Skipping PROTECTED tag '{tag_name}'", "ERROR")
             continue
         
         tag_commit_id = (tag_obj.get('commit') or {}).get('id') if tag_obj else None
         
         if tag_commit_id and feature_head and tag_commit_id == feature_head:
-            log(f"[IDEMPOTENT] Tag '{tag_name}' already points to feature branch HEAD ({feature_head[:8]}). Skipping tag recreation.", "INFO")
+            log(f"[{p_name}] Tag '{tag_name}' already points to feature branch HEAD ({feature_head[:8]}). Skipping tag recreation", "INFO")
             
             idempotent_tags.append(tag_name)
             
-            log(f"Tag '{tag_name}' is already correct. Proceeding with deployment check...", "INFO")
+            log(f"[{p_name}] Tag '{tag_name}' is already correct. Proceeding with deployment check...", "INFO")
             created_tag_commit = tag_commit_id
             
         else:
             if tag_obj:
-                log(f"Deleting existing tag '{tag_name}' (currently at {tag_commit_id[:8] if tag_commit_id else 'unknown'})...", "INFO")
+                log(f"[{p_name}] Deleting existing tag '{tag_name}' (currently at {tag_commit_id[:8] if tag_commit_id else 'unknown'})...", "INFO")
                 api_call(f"projects/{pid}/repository/tags/{quoted_tag}", method="DELETE")
             
-            log(f"Creating tag '{tag_name}' on {FEATURE_BRANCH} ({feature_head[:8] if feature_head else 'unknown'})...", "INFO")
+            log(f"[{p_name}] Creating tag '{tag_name}' on {FEATURE_BRANCH} ({feature_head[:8] if feature_head else 'unknown'})...", "INFO")
             t_res = api_call(f"projects/{pid}/repository/tags", "POST", {"tag_name": tag_name, "ref": FEATURE_BRANCH})
             
             if isinstance(t_res, dict) and not t_res.get("error"):
-                log(f"Created tag '{tag_name}' on {FEATURE_BRANCH}", "INFO")
+                log(f"[{p_name}] Created tag '{tag_name}' on {FEATURE_BRANCH}", "INFO")
                 created_tag_commit = (t_res.get('commit') or {}).get('id') if isinstance(t_res, dict) else None
             else:
-                log(f"Failed to create tag '{tag_name}': {t_res.get('details')}", "ERROR")
+                log(f"[{p_name}] Failed to create tag '{tag_name}': {t_res.get('details')}", "ERROR")
                 continue
         
         if created_tag_commit:
-                log("Waiting 10 seconds for pipeline to be triggered...", "INFO")
+                log(f"[{p_name}] Waiting 10 seconds for pipeline to be triggered...", "INFO")
                 time.sleep(10)
                 
                 if INTERRUPTED:
-                    log("Deployment interrupted during pipeline wait", "WARN")
+                    log(f"[{p_name}] Deployment interrupted during pipeline wait", "WARN")
                     break
                 
                 pipeline = get_pipeline_for_commit(pid, created_tag_commit)
                 if not pipeline:
-                    log(f"No pipeline found for commit {created_tag_commit[:8]}", "WARN")
+                    log(f"[{p_name}] No pipeline found for commit {created_tag_commit[:8]}", "WARN")
                     continue
                 
                 pipeline_id = pipeline.get('id')
-                log(f"Found pipeline {pipeline_id}", "INFO")
+                log(f"[{p_name}] Found pipeline {pipeline_id}", "INFO")
                 
                 result = wait_for_pipeline_completion(pid, pipeline_id, timeout=1800, check_interval=30)
                 
                 if result['status'] == 'interrupted':
-                    log("Pipeline monitoring interrupted", "WARN")
+                    log(f"[{p_name}] Pipeline monitoring interrupted", "WARN")
                     break
                 
                 if result['status'] != 'success':
-                    log(f"Build {result['status']} for tag '{tag_name}'", "ERROR")
+                    log(f"[{p_name}] Build {result['status']} for tag '{tag_name}'", "ERROR")
                     continue
                 
-                log(f"Build succeeded for tag '{tag_name}'!", "INFO")
+                log(f"[{p_name}] Build succeeded for tag '{tag_name}'!", "INFO")
                 
                 jobs = get_pipeline_jobs(pid, pipeline_id)
                 
                 terminate_job = find_job_by_name(jobs, 'eb-terminate')
                 if terminate_job and terminate_job.get('status') == 'manual':
-                    log("Triggering 'eb-terminate' job...", "INFO")
+                    log(f"[{p_name}] Triggering 'eb-terminate' job...", "INFO")
                     trigger_manual_job(pid, terminate_job.get('id'))
                     terminate_result = wait_for_job_completion(pid, terminate_job.get('id'), timeout=900)
                     
                     if terminate_result['status'] == 'interrupted':
-                        log("Terminate job interrupted", "WARN")
+                        log(f"[{p_name}] Terminate job interrupted", "WARN")
                         break
                     
                     if terminate_result['status'] != 'success':
-                        log(f"eb-terminate job {terminate_result['status']}", "ERROR")
+                        log(f"[{p_name}] eb-terminate job {terminate_result['status']}", "ERROR")
                         continue
                 
                 deploy_job_name = map_tag_to_deploy_job(tag_name)
@@ -1712,16 +1797,16 @@ def handle_deployment(pid, p_name, state=None):
                     deploy_job = find_job_by_name(jobs, deploy_job_name)
                     
                     if deploy_job and deploy_job.get('status') == 'manual':
-                        log(f"Triggering '{deploy_job_name}' job...", "INFO")
+                        log(f"[{p_name}] Triggering '{deploy_job_name}' job...", "INFO")
                         trigger_manual_job(pid, deploy_job.get('id'))
                         deploy_result = wait_for_job_completion(pid, deploy_job.get('id'), timeout=1200)
                         
                         if deploy_result['status'] == 'interrupted':
-                            log("Deploy job interrupted", "WARN")
+                            log(f"[{p_name}] Deploy job interrupted", "WARN")
                             break
                         
                         if deploy_result['status'] == 'success':
-                            log(f"[SUCCESS] Deployment completed for tag '{tag_name}'!", "INFO")
+                            log(f"[{p_name}] Deployment completed for tag '{tag_name}'!", "INFO")
                             deployment_successful = True
                             
                             if state is not None:
@@ -1734,9 +1819,9 @@ def handle_deployment(pid, p_name, state=None):
                                 state['project_details'][str(pid)]['completed_tags'].append(tag_name)
                                 state['project_details'][str(pid)]['last_pipeline_id'] = pipeline_id
                                 save_state(state)
-                                log(f"State saved: tag '{tag_name}' marked complete for project {pid}", "DEBUG")
+                                log(f"[{p_name}] State saved: tag '{tag_name}' marked complete", "DEBUG")
                         else:
-                            log(f"Deployment {deploy_result['status']} for tag '{tag_name}'", "ERROR")
+                            log(f"[{p_name}] Deployment {deploy_result['status']} for tag '{tag_name}'", "ERROR")
                             if state is not None:
                                 if str(pid) not in state['project_details']:
                                     state['project_details'][str(pid)] = {
@@ -1747,7 +1832,7 @@ def handle_deployment(pid, p_name, state=None):
                                 state['project_details'][str(pid)]['failed_tags'].append(tag_name)
                                 save_state(state)
         else:
-            log(f"No commit available for tag '{tag_name}', skipping deployment", "WARN")
+            log(f"[{p_name}] No commit available for tag '{tag_name}', skipping deployment", "WARN")
     
     return {'success': deployment_successful, 'idempotent_tags': idempotent_tags}
 
@@ -1785,7 +1870,8 @@ def bulk_create_mrs(project_ids, rollback_data, state):
                 results['skipped'] += 1
                 
         except Exception as e:
-            log(f"Error processing project {pid}: {e}", "ERROR")
+            p_name = PROJECT_NAMES.get(pid, f"ID:{pid}")
+            log(f"[{p_name}] Error processing project: {e}", "ERROR")
             results['failed'] += 1
     
     log("\n" + "=" * 70, "INFO")
@@ -2176,6 +2262,10 @@ def main():
         log("=" * 70, "INFO")
 
     load_config_from_env()
+    
+    if not NEW_DEFAULT_PLATFORM:
+        log("WARNING: NEW_DEFAULT_PLATFORM not configured in .env file", "WARN")
+        log("ElasticBeanstalk platform updates will be skipped", "WARN")
 
     log("Fetching current user information...", "INFO")
     current_user = get_current_user()
@@ -2356,7 +2446,8 @@ def main():
                     INTERRUPTED = True
                     break
                 except Exception as e:
-                    log(f"Error processing project {pid}: {e}", "ERROR")
+                    p_name = PROJECT_NAMES.get(pid, f"ID:{pid}")
+                    log(f"[{p_name}] Error processing project: {e}", "ERROR")
         
         if rollback_data['snapshots']:
             rollback_file = save_rollback_data(rollback_data)
