@@ -1,563 +1,591 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-import threading
-from datetime import datetime
+from flask import Flask, render_template, request, jsonify, send_from_directory
+import urllib.request
+import urllib.parse
+import urllib.error
+import json
 import base64
 import re
-import time
-import json
+import datetime
 import os
+import logging
+from functools import wraps
 
-app = Flask(__name__)
-CORS(app)
+app = Flask(__name__, static_folder='static', template_folder='.')
 
-import migration_script as ms
+# Configuration
+BASE_URL = os.getenv('GITLAB_BASE_URL', '').rstrip('/')
+TOKEN = os.getenv('GITLAB_TOKEN', '')
+FEATURE_BRANCH = os.getenv('FEATURE_BRANCH', 'task-1293-java17-migration')
+SOURCE_BRANCH = os.getenv('SOURCE_BRANCH', 'develop')
+TARGET_PARENT_VERSION = os.getenv('TARGET_PARENT_VERSION', '1.8.3')
+NEW_DEFAULT_PLATFORM = os.getenv('NEW_DEFAULT_PLATFORM', '')
 
-env_config = ms.load_env_config()
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Load configuration from .env file
+def load_env_config():
+    """Load configuration from .env file"""
+    config = {
+        'base_url': '',
+        'token': '',
+        'projects': {},
+        'new_default_platform': '',
+        'reviewer_usernames': [],
+        'assignee_usernames': []
+    }
+    
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    env_file = os.path.join(script_dir, '.env')
+    
+    if not os.path.exists(env_file):
+        logger.warning(".env file not found")
+        return config
+    
+    try:
+        with open(env_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                
+                if '=' in line:
+                    key, value = line.split('=', 1)
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    
+                    if key in ('BASE_URL', 'GITLAB_BASE_URL', 'GITLAB_URL'):
+                        config['base_url'] = value.rstrip('/')
+                    elif key in ('GITLAB_TOKEN', 'TOKEN'):
+                        config['token'] = value
+                    elif key == 'NEW_DEFAULT_PLATFORM':
+                        config['new_default_platform'] = value
+                    elif key == 'REVIEWER_USERNAMES':
+                        config['reviewer_usernames'] = [x.strip() for x in value.split(',') if x.strip()]
+                    elif key == 'ASSIGNEE_USERNAMES':
+                        config['assignee_usernames'] = [x.strip() for x in value.split(',') if x.strip()]
+                    elif key.startswith('PROJECT_'):
+                        try:
+                            project_id = int(key.replace('PROJECT_', ''))
+                            config['projects'][project_id] = value
+                        except ValueError:
+                            pass
+    except Exception as e:
+        logger.error(f"Error reading .env file: {e}")
+    
+    return config
+
+# Load config on startup
+env_config = load_env_config()
+if env_config['base_url']:
+    BASE_URL = env_config['base_url']
+if env_config['token']:
+    TOKEN = env_config['token']
+if env_config['new_default_platform']:
+    NEW_DEFAULT_PLATFORM = env_config['new_default_platform']
+
 PROJECT_NAMES = env_config['projects']
 
-ms.BASE_URL = env_config['base_url']
-ms.TOKEN = env_config['token']
-ms.NEW_DEFAULT_PLATFORM = env_config['new_default_platform']
-ms.REVIEWER_USERNAMES = env_config['reviewer_usernames']
-ms.ASSIGNEE_USERNAMES = env_config['assignee_usernames']
+def retry(tries=3, delay=1, backoff=2):
+    """Retry decorator for API calls"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            _tries, _delay = tries, delay
+            while True:
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    _tries -= 1
+                    if _tries <= 0:
+                        raise
+                    logger.warning(f"Retrying {func.__name__}: {e}")
+                    import time
+                    time.sleep(_delay)
+                    _delay *= backoff
+        return wrapper
+    return decorator
 
-active_tasks = {}
-project_history = []
-STATE_FILE = 'project_state.json'
+@retry(tries=3, delay=1, backoff=2)
+def api_call(endpoint, method="GET", data=None):
+    """Make API call to GitLab"""
+    url = f"{BASE_URL}/api/v4/{endpoint.lstrip('/')}"
+    
+    if not TOKEN:
+        raise RuntimeError("GitLab token not configured")
+    
+    body = json.dumps(data).encode("utf-8") if data else None
+    req = urllib.request.Request(url, method=method, data=body)
+    req.add_header("PRIVATE-TOKEN", TOKEN)
+    req.add_header("Content-Type", "application/json")
+    
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            text = response.read().decode("utf-8")
+            return json.loads(text) if text else {}
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8") if e.fp else ""
+        logger.error(f"HTTP {e.code} for {url}: {error_body}")
+        raise Exception(f"GitLab API error: {e.code}")
+    except urllib.error.URLError as e:
+        logger.error(f"URL error for {url}: {e}")
+        raise Exception(f"Network error: {e}")
 
-def load_project_state():
-    global project_history
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, 'r') as f:
-                project_history = json.load(f)
-        except:
-            project_history = []
-    else:
-        project_history = []
+def update_parent_block(match):
+    """Update parent POM version"""
+    block = match.group(0)
+    block = re.sub(r"<version>.*?</version>", f"<version>{TARGET_PARENT_VERSION}</version>", block)
+    block = re.sub(r"(parent-pom-).*?(\.xml)", lambda m: m.group(1) + TARGET_PARENT_VERSION + m.group(2), block)
+    return block
 
-def save_project_state():
-    with open(STATE_FILE, 'w') as f:
-        json.dump(project_history, f, indent=2)
-
-def add_project_to_history(project_id, project_name, action, status, details=None):
-    entry = {
-        'project_id': project_id,
-        'project_name': project_name,
-        'action': action,
-        'status': status,
-        'timestamp': datetime.now().isoformat(),
-        'details': details or {}
-    }
-    project_history.insert(0, entry)
-    if len(project_history) > 100:
-        project_history = project_history[:100]
-    save_project_state()
-
-load_project_state()
-
-
+# Routes
 @app.route('/')
 def index():
-    with open('index.html', 'r', encoding='utf-8') as f:
-        return f.read()
+    """Serve the main HTML page"""
+    return send_from_directory('.', 'index.html')
 
-
-@app.route('/api/config', methods=['GET'])
-def get_config():
-    return jsonify({
-        'success': True,
-        'projects': [{'id': pid, 'name': name} for pid, name in sorted(PROJECT_NAMES.items())],
-        'reviewers': env_config['reviewer_usernames'],
-        'assignees': env_config['assignee_usernames']
-    })
-
-
-@app.route('/api/history', methods=['GET'])
-def get_history():
-    return jsonify({
-        'success': True,
-        'history': project_history
-    })
-
-
-@app.route('/api/projects/<int:project_id>/preview', methods=['POST'])
-def preview_changes(project_id):
+@app.route('/api/projects', methods=['GET'])
+def get_projects():
+    """Get all configured projects with their details"""
     try:
-        data = request.json
-        choices = data.get('choices', [])
-        branch = data.get('branch', 'develop')
+        projects_list = []
         
-        actions = []
-        
-        if '1' in choices:
-            res = ms.api_call(f"projects/{project_id}/repository/files/pom.xml?ref={branch}")
-            if isinstance(res, dict) and "content" in res:
-                orig = base64.b64decode(res['content']).decode('utf-8')
-                upd = re.sub(r"<(java\.version|maven\.compiler\.(source|target|release))>11</\1>", r"<\1>17</\1>", orig)
-                if "<parent>" in upd:
-                    upd = re.sub(r"<parent>[\s\S]*?</parent>", ms.update_parent_block, upd)
-                if orig != upd:
-                    actions.append({
-                        'file_path': 'pom.xml',
-                        'old_content': orig,
-                        'new_content': upd,
-                        'diff': generate_diff(orig, upd)
-                    })
-        
-        if '2' in choices:
-            res = ms.api_call(f"projects/{project_id}/repository/files/.gitlab-ci.yml?ref={branch}")
-            if isinstance(res, dict) and "content" in res:
-                orig = base64.b64decode(res['content']).decode('utf-8')
-                upd = re.sub(r"^\s*image:.*(\n|$)", "", orig, flags=re.MULTILINE)
-                if orig != upd:
-                    actions.append({
-                        'file_path': '.gitlab-ci.yml',
-                        'old_content': orig,
-                        'new_content': upd,
-                        'diff': generate_diff(orig, upd)
-                    })
-        
-        if '3' in choices:
-            path = ".elasticbeanstalk/config.yml"
-            encoded_path = ".elasticbeanstalk%2Fconfig.yml"
-            res = ms.api_call(f"projects/{project_id}/repository/files/{encoded_path}?ref={branch}")
-            if isinstance(res, dict) and "content" in res:
-                orig = base64.b64decode(res['content']).decode('utf-8')
-                upd = re.sub(r"(default_platform:\s*).*$", f"default_platform: {ms.NEW_DEFAULT_PLATFORM}", orig, flags=re.MULTILINE)
-                if orig != upd:
-                    actions.append({
-                        'file_path': path,
-                        'old_content': orig,
-                        'new_content': upd,
-                        'diff': generate_diff(orig, upd)
-                    })
-        
-        return jsonify({'success': True, 'actions': actions})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-
-@app.route('/api/projects/<int:project_id>/commit', methods=['POST'])
-def commit_changes(project_id):
-    try:
-        data = request.json
-        choices = data.get('choices', [])
-        branch_num = data.get('branch_num', '12938')
-        
-        ms.JIRA_ID = branch_num
-        ms.FEATURE_BRANCH = f"task-{branch_num}-{ms.UPGRADE_TYPE}"
-        ms.MR_TITLE = f"TASK-{branch_num}: java migration"
-        
-        task_id = f"commit_{project_id}_{int(datetime.now().timestamp())}"
-        
-        def run_commit():
-            logs = []
+        for project_id, project_name in PROJECT_NAMES.items():
             try:
-                p_name = PROJECT_NAMES.get(project_id, f"Project {project_id}")
-                logs.append({'level': 'INFO', 'message': f'Starting commit for {p_name}'})
+                # Get project details from GitLab
+                project_info = api_call(f"projects/{project_id}")
                 
-                ms.create_feature_branch(project_id, p_name)
-                logs.append({'level': 'INFO', 'message': f'Feature branch created: {ms.FEATURE_BRANCH}'})
+                # Check if feature branch exists
+                branch_exists = False
+                try:
+                    branch_info = api_call(f"projects/{project_id}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
+                    branch_exists = 'name' in branch_info
+                except:
+                    pass
                 
-                actions = []
-                current_ref = ms.FEATURE_BRANCH
-                
-                if '1' in choices:
-                    res = ms.api_call(f"projects/{project_id}/repository/files/pom.xml?ref={current_ref}")
-                    if isinstance(res, dict) and "content" in res:
-                        orig = base64.b64decode(res['content']).decode('utf-8')
-                        upd = re.sub(r"<(java\.version|maven\.compiler\.(source|target|release))>11</\1>", r"<\1>17</\1>", orig)
-                        if "<parent>" in upd:
-                            upd = re.sub(r"<parent>[\s\S]*?</parent>", ms.update_parent_block, upd)
-                        if orig != upd:
-                            actions.append({"action": "update", "file_path": "pom.xml", "content": upd})
-                            logs.append({'level': 'INFO', 'message': 'POM.xml updated'})
-                
-                if '2' in choices:
-                    res = ms.api_call(f"projects/{project_id}/repository/files/.gitlab-ci.yml?ref={current_ref}")
-                    if isinstance(res, dict) and "content" in res:
-                        orig = base64.b64decode(res['content']).decode('utf-8')
-                        upd = re.sub(r"^\s*image:.*(\n|$)", "", orig, flags=re.MULTILINE)
-                        if orig != upd:
-                            actions.append({"action": "update", "file_path": ".gitlab-ci.yml", "content": upd})
-                            logs.append({'level': 'INFO', 'message': '.gitlab-ci.yml updated'})
-                
-                if '3' in choices:
-                    path = ".elasticbeanstalk/config.yml"
-                    encoded_path = ".elasticbeanstalk%2Fconfig.yml"
-                    res = ms.api_call(f"projects/{project_id}/repository/files/{encoded_path}?ref={current_ref}")
-                    if isinstance(res, dict) and "content" in res:
-                        orig = base64.b64decode(res['content']).decode('utf-8')
-                        upd = re.sub(r"(default_platform:\s*).*$", f"default_platform: {ms.NEW_DEFAULT_PLATFORM}", orig, flags=re.MULTILINE)
-                        if orig != upd:
-                            actions.append({"action": "update", "file_path": path, "content": upd})
-                            logs.append({'level': 'INFO', 'message': 'Elastic Beanstalk config updated'})
-                
-                if actions:
-                    commit_payload = {
-                        "branch": ms.FEATURE_BRANCH,
-                        "commit_message": f"fix: {ms.UPGRADE_TYPE}",
-                        "actions": actions
-                    }
-                    
-                    logs.append({'level': 'INFO', 'message': f'Committing {len(actions)} file(s)...'})
-                    commit_resp = ms.api_call(f"projects/{project_id}/repository/commits", "POST", commit_payload)
-                    
-                    if isinstance(commit_resp, dict) and not commit_resp.get("error"):
-                        logs.append({'level': 'SUCCESS', 'message': 'Commit successful!'})
-                        add_project_to_history(project_id, p_name, 'commit', 'success', {
-                            'commit_sha': commit_resp.get('id'),
-                            'files': len(actions)
-                        })
-                        active_tasks[task_id] = {
-                            'status': 'completed',
-                            'message': 'Committed successfully',
-                            'logs': logs
-                        }
-                    else:
-                        logs.append({'level': 'ERROR', 'message': f"Commit failed: {commit_resp.get('details', 'unknown')}"})
-                        add_project_to_history(project_id, p_name, 'commit', 'failed')
-                        active_tasks[task_id] = {
-                            'status': 'failed',
-                            'message': 'Commit failed',
-                            'logs': logs
-                        }
-                else:
-                    logs.append({'level': 'INFO', 'message': 'No changes to commit'})
-                    active_tasks[task_id] = {
-                        'status': 'completed',
-                        'message': 'No changes to commit',
-                        'logs': logs
-                    }
-                    
+                projects_list.append({
+                    'id': project_id,
+                    'name': project_name,
+                    'web_url': project_info.get('web_url', ''),
+                    'branch_exists': branch_exists,
+                    'default_branch': project_info.get('default_branch', 'main')
+                })
             except Exception as e:
-                logs.append({'level': 'ERROR', 'message': f'Error: {str(e)}'})
-                add_project_to_history(project_id, PROJECT_NAMES.get(project_id, ''), 'commit', 'failed')
-                active_tasks[task_id] = {
-                    'status': 'failed',
-                    'message': str(e),
-                    'logs': logs
-                }
-        
-        thread = threading.Thread(target=run_commit)
-        thread.daemon = True
-        thread.start()
-        
-        active_tasks[task_id] = {
-            'status': 'running',
-            'message': 'Committing...',
-            'logs': []
-        }
-        
-        return jsonify({'success': True, 'task_id': task_id})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-
-@app.route('/api/projects/<int:project_id>/mr', methods=['POST'])
-def create_mr(project_id):
-    try:
-        data = request.json
-        branch_num = data.get('branch_num', '12938')
-        
-        ms.JIRA_ID = branch_num
-        ms.FEATURE_BRANCH = f"task-{branch_num}-{ms.UPGRADE_TYPE}"
-        ms.MR_TITLE = f"TASK-{branch_num}: java migration"
-        
-        task_id = f"mr_{project_id}_{int(datetime.now().timestamp())}"
-        
-        def run_mr():
-            logs = []
-            try:
-                p_name = PROJECT_NAMES.get(project_id, f"Project {project_id}")
-                logs.append({'level': 'INFO', 'message': f'Creating MR for {p_name}'})
-                
-                result = ms.create_mr_for_project(project_id, p_name, {'snapshots': []})
-                
-                if result['success']:
-                    logs.append({'level': 'SUCCESS', 'message': f"MR created: {result.get('url', 'N/A')}"})
-                    add_project_to_history(project_id, p_name, 'mr', 'success', {
-                        'url': result.get('url')
-                    })
-                    active_tasks[task_id] = {
-                        'status': 'completed',
-                        'message': f"MR created: {result.get('url', 'N/A')}",
-                        'logs': logs,
-                        'url': result.get('url')
-                    }
-                else:
-                    logs.append({'level': 'ERROR', 'message': 'Failed to create MR'})
-                    add_project_to_history(project_id, p_name, 'mr', 'failed')
-                    active_tasks[task_id] = {
-                        'status': 'failed',
-                        'message': 'Failed to create MR',
-                        'logs': logs
-                    }
-            except Exception as e:
-                logs.append({'level': 'ERROR', 'message': f'Error: {str(e)}'})
-                add_project_to_history(project_id, PROJECT_NAMES.get(project_id, ''), 'mr', 'failed')
-                active_tasks[task_id] = {
-                    'status': 'failed',
-                    'message': str(e),
-                    'logs': logs
-                }
-        
-        thread = threading.Thread(target=run_mr)
-        thread.daemon = True
-        thread.start()
-        
-        active_tasks[task_id] = {
-            'status': 'running',
-            'message': 'Creating MR...',
-            'logs': []
-        }
-        
-        return jsonify({'success': True, 'task_id': task_id})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-
-@app.route('/api/projects/<int:project_id>/tags', methods=['GET'])
-def get_tags(project_id):
-    try:
-        tags_resp = ms.fetch_all_tags_for_project(project_id)
-        
-        if isinstance(tags_resp, dict) and tags_resp.get("error"):
-            return jsonify({'success': False, 'error': tags_resp.get('details')}), 500
-        
-        filter_result = ms.filter_and_sort_deployment_tags(tags_resp)
+                logger.error(f"Error fetching project {project_id}: {e}")
+                projects_list.append({
+                    'id': project_id,
+                    'name': project_name,
+                    'web_url': '',
+                    'branch_exists': False,
+                    'error': str(e)
+                })
         
         return jsonify({
             'success': True,
-            'tags': filter_result['sorted_tags']
+            'projects': projects_list,
+            'feature_branch': FEATURE_BRANCH,
+            'source_branch': SOURCE_BRANCH
         })
     except Exception as e:
+        logger.error(f"Error in get_projects: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
-
-@app.route('/api/projects/<int:project_id>/deploy', methods=['POST'])
-def deploy(project_id):
+@app.route('/api/changes/<int:project_id>', methods=['GET'])
+def get_changes(project_id):
+    """Get proposed changes for a project"""
     try:
-        data = request.json
-        selected_tags = data.get('tags', [])
-        create_mr_on_success = data.get('create_mr_on_success', False)
-        branch_num = data.get('branch_num', '12938')
+        file_types = request.args.get('files', '1,2,3').split(',')
         
-        ms.JIRA_ID = branch_num
-        ms.FEATURE_BRANCH = f"task-{branch_num}-{ms.UPGRADE_TYPE}"
-        ms.MR_TITLE = f"TASK-{branch_num}: java migration"
+        # Determine which branch to use
+        try:
+            branch_check = api_call(f"projects/{project_id}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
+            current_ref = FEATURE_BRANCH if 'name' in branch_check else SOURCE_BRANCH
+        except:
+            current_ref = SOURCE_BRANCH
         
-        task_id = f"deploy_{project_id}_{int(datetime.now().timestamp())}"
+        changes = []
         
-        def run_deploy():
-            logs = []
+        # POM.xml changes
+        if '1' in file_types:
             try:
-                p_name = PROJECT_NAMES.get(project_id, f"Project {project_id}")
-                logs.append({'level': 'INFO', 'message': f'Starting deployment for {p_name}'})
-                
-                branch_info = ms.api_call(f"projects/{project_id}/repository/branches/{ms.FEATURE_BRANCH}")
-                feature_head = (branch_info.get("commit") or {}).get("id") if isinstance(branch_info, dict) else None
-                
-                if not feature_head:
-                    logs.append({'level': 'ERROR', 'message': 'Feature branch not found'})
-                    add_project_to_history(project_id, p_name, 'deploy', 'failed')
-                    active_tasks[task_id] = {'status': 'failed', 'message': 'Feature branch not found', 'logs': logs}
-                    return
-                
-                all_builds_successful = True
-                deployment_results = []
-                
-                for tag_name in selected_tags:
-                    logs.append({'level': 'INFO', 'message': f'Processing tag: {tag_name}'})
+                pom_response = api_call(f"projects/{project_id}/repository/files/{urllib.parse.quote('pom.xml', safe='')}?ref={urllib.parse.quote(current_ref, safe='')}")
+                if 'content' in pom_response:
+                    orig_content = base64.b64decode(pom_response['content']).decode('utf-8')
+                    updated_content = re.sub(
+                        r"<(java\.version|maven\.compiler\.(source|target|release))>11</\1>",
+                        r"<\1>17</\1>",
+                        orig_content
+                    )
+                    if "<parent>" in updated_content:
+                        updated_content = re.sub(r"<parent>[\s\S]*?</parent>", update_parent_block, updated_content)
                     
-                    tags_resp = ms.fetch_all_tags_for_project(project_id)
-                    tag_obj = next((t for t in tags_resp if isinstance(t, dict) and t.get('name') == tag_name), None) if isinstance(tags_resp, list) else None
-                    
-                    if tag_obj and not tag_obj.get('protected'):
-                        ms.api_call(f"projects/{project_id}/repository/tags/{tag_name}", method="DELETE")
-                        logs.append({'level': 'INFO', 'message': f'Deleted existing tag {tag_name}'})
-                    
-                    logs.append({'level': 'INFO', 'message': f'Creating tag {tag_name}'})
-                    t_res = ms.api_call(f"projects/{project_id}/repository/tags", "POST", {"tag_name": tag_name, "ref": ms.FEATURE_BRANCH})
-                    
-                    if isinstance(t_res, dict) and not t_res.get("error"):
-                        created_commit = (t_res.get('commit') or {}).get('id')
-                        
-                        time.sleep(10)
-                        
-                        pipeline = ms.get_pipeline_for_commit(project_id, created_commit)
-                        if pipeline:
-                            pipeline_id = pipeline.get('id')
-                            logs.append({'level': 'INFO', 'message': f'Pipeline {pipeline_id} triggered'})
-                            
-                            result = ms.wait_for_pipeline_completion(project_id, pipeline_id, timeout=1800, check_interval=30)
-                            
-                            if result['status'] == 'success':
-                                logs.append({'level': 'SUCCESS', 'message': f'Build succeeded for {tag_name}'})
-                                
-                                jobs = ms.get_pipeline_jobs(project_id, pipeline_id)
-                                terminate_job = ms.find_job_by_name(jobs, 'eb-terminate')
-                                if terminate_job:
-                                    logs.append({'level': 'INFO', 'message': 'Triggering eb-terminate'})
-                                    ms.trigger_manual_job(project_id, terminate_job.get('id'))
-                                    ms.wait_for_job_completion(project_id, terminate_job.get('id'), timeout=900)
-                                    logs.append({'level': 'INFO', 'message': 'Termination completed'})
-                                
-                                deploy_job_name = ms.map_tag_to_deploy_job(tag_name)
-                                if deploy_job_name:
-                                    jobs = ms.get_pipeline_jobs(project_id, pipeline_id)
-                                    deploy_job = ms.find_job_by_name(jobs, deploy_job_name)
-                                    if deploy_job:
-                                        logs.append({'level': 'INFO', 'message': f'Triggering {deploy_job_name}'})
-                                        ms.trigger_manual_job(project_id, deploy_job.get('id'))
-                                        deploy_result = ms.wait_for_job_completion(project_id, deploy_job.get('id'), timeout=1200)
-                                        
-                                        if deploy_result['status'] == 'success':
-                                            logs.append({'level': 'SUCCESS', 'message': f'Deployment SUCCESS for {tag_name}'})
-                                            deployment_results.append({'tag': tag_name, 'success': True})
-                                        else:
-                                            logs.append({'level': 'ERROR', 'message': f'Deployment FAILED for {tag_name}'})
-                                            deployment_results.append({'tag': tag_name, 'success': False})
-                                            all_builds_successful = False
-                            else:
-                                logs.append({'level': 'ERROR', 'message': f'Build FAILED for {tag_name}'})
-                                deployment_results.append({'tag': tag_name, 'success': False})
-                                all_builds_successful = False
-                
-                if all_builds_successful:
-                    add_project_to_history(project_id, p_name, 'deploy', 'success', {
-                        'tags': selected_tags,
-                        'results': deployment_results
-                    })
-                    
-                    if create_mr_on_success:
-                        logs.append({'level': 'INFO', 'message': 'All builds successful, creating MR...'})
-                        mr_result = ms.create_mr_for_project(project_id, p_name, {'snapshots': []})
-                        if mr_result['success']:
-                            logs.append({'level': 'SUCCESS', 'message': f"MR created: {mr_result.get('url', 'N/A')}"})
-                        else:
-                            logs.append({'level': 'ERROR', 'message': 'MR creation failed'})
-                else:
-                    add_project_to_history(project_id, p_name, 'deploy', 'failed', {
-                        'tags': selected_tags,
-                        'results': deployment_results
-                    })
-                
-                logs.append({'level': 'INFO', 'message': 'Deployment process completed'})
-                active_tasks[task_id] = {
-                    'status': 'completed',
-                    'message': 'Deployment completed',
-                    'logs': logs,
-                    'all_successful': all_builds_successful
-                }
-                
+                    if orig_content != updated_content:
+                        changes.append({
+                            'file_path': 'pom.xml',
+                            'old_content': orig_content,
+                            'new_content': updated_content
+                        })
             except Exception as e:
-                logs.append({'level': 'ERROR', 'message': f'Error: {str(e)}'})
-                add_project_to_history(project_id, PROJECT_NAMES.get(project_id, ''), 'deploy', 'failed')
-                active_tasks[task_id] = {
-                    'status': 'failed',
-                    'message': str(e),
-                    'logs': logs
-                }
+                logger.error(f"Error getting pom.xml for project {project_id}: {e}")
         
-        thread = threading.Thread(target=run_deploy)
-        thread.daemon = True
-        thread.start()
+        # .gitlab-ci.yml changes
+        if '2' in file_types:
+            try:
+                ci_response = api_call(f"projects/{project_id}/repository/files/{urllib.parse.quote('.gitlab-ci.yml', safe='')}?ref={urllib.parse.quote(current_ref, safe='')}")
+                if 'content' in ci_response:
+                    orig_content = base64.b64decode(ci_response['content']).decode('utf-8')
+                    updated_content = re.sub(r"^\s*image:.*(\n|$)", "", orig_content, flags=re.MULTILINE)
+                    
+                    if orig_content != updated_content:
+                        changes.append({
+                            'file_path': '.gitlab-ci.yml',
+                            'old_content': orig_content,
+                            'new_content': updated_content
+                        })
+            except Exception as e:
+                logger.error(f"Error getting .gitlab-ci.yml for project {project_id}: {e}")
         
-        active_tasks[task_id] = {
-            'status': 'running',
-            'message': 'Starting deployment...',
-            'logs': []
+        # Elastic Beanstalk config changes
+        if '3' in file_types:
+            try:
+                eb_response = api_call(f"projects/{project_id}/repository/files/{urllib.parse.quote('.elasticbeanstalk/config.yml', safe='')}?ref={urllib.parse.quote(current_ref, safe='')}")
+                if 'content' in eb_response:
+                    orig_content = base64.b64decode(eb_response['content']).decode('utf-8')
+                    
+                    if NEW_DEFAULT_PLATFORM:
+                        updated_content = re.sub(
+                            r"(default_platform:\s*).*$",
+                            f"default_platform: {NEW_DEFAULT_PLATFORM}",
+                            orig_content,
+                            flags=re.MULTILINE
+                        )
+                        
+                        if orig_content != updated_content:
+                            changes.append({
+                                'file_path': '.elasticbeanstalk/config.yml',
+                                'old_content': orig_content,
+                                'new_content': updated_content
+                            })
+            except Exception as e:
+                logger.error(f"Error getting .elasticbeanstalk/config.yml for project {project_id}: {e}")
+        
+        return jsonify({
+            'success': True,
+            'changes': changes
+        })
+    except Exception as e:
+        logger.error(f"Error in get_changes: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/commit', methods=['POST'])
+def commit_changes():
+    """Commit changes to GitLab"""
+    try:
+        data = request.get_json()
+        project_id = data.get('project_id')
+        branch = data.get('branch', FEATURE_BRANCH)
+        actions = data.get('actions', [])
+        
+        if not project_id or not actions:
+            return jsonify({'success': False, 'error': 'Missing project_id or actions'}), 400
+        
+        # Ensure feature branch exists
+        try:
+            branch_check = api_call(f"projects/{project_id}/repository/branches/{urllib.parse.quote(branch, safe='')}")
+        except:
+            # Create feature branch from source branch
+            try:
+                api_call(
+                    f"projects/{project_id}/repository/branches",
+                    "POST",
+                    {"branch": branch, "ref": SOURCE_BRANCH}
+                )
+                logger.info(f"Created feature branch {branch} for project {project_id}")
+            except Exception as e:
+                return jsonify({'success': False, 'error': f'Failed to create branch: {str(e)}'}), 500
+        
+        # Prepare commit actions
+        commit_actions = []
+        for action in actions:
+            commit_actions.append({
+                'action': 'update',
+                'file_path': action['file_path'],
+                'content': action['content']
+            })
+        
+        # Commit changes
+        commit_payload = {
+            "branch": branch,
+            "commit_message": "fix: java17-migration",
+            "actions": commit_actions
         }
         
-        return jsonify({'success': True, 'task_id': task_id})
+        commit_response = api_call(f"projects/{project_id}/repository/commits", "POST", commit_payload)
+        
+        if 'id' in commit_response:
+            return jsonify({
+                'success': True,
+                'commit_sha': commit_response['id'],
+                'message': 'Changes committed successfully'
+            })
+        else:
+            return jsonify({'success': False, 'error': 'Commit failed'}), 500
+            
     except Exception as e:
+        logger.error(f"Error in commit_changes: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
-
-@app.route('/api/bulk-mr', methods=['POST'])
-def bulk_mr():
+@app.route('/api/mr', methods=['POST'])
+def create_merge_request():
+    """Create merge request"""
     try:
-        data = request.json
-        project_ids = data.get('project_ids', [])
-        branch_num = data.get('branch_num', '12938')
+        data = request.get_json()
+        project_id = data.get('project_id')
+        source_branch = data.get('source_branch', FEATURE_BRANCH)
+        target_branch = data.get('target_branch', SOURCE_BRANCH)
+        title = data.get('title', f'TASK-1293: java migration')
         
-        ms.JIRA_ID = branch_num
-        ms.FEATURE_BRANCH = f"task-{branch_num}-{ms.UPGRADE_TYPE}"
-        ms.MR_TITLE = f"TASK-{branch_num}: java migration"
+        if not project_id:
+            return jsonify({'success': False, 'error': 'Missing project_id'}), 400
         
-        task_id = f"bulk_mr_{int(datetime.now().timestamp())}"
+        # Check if MR already exists
+        existing_mrs = api_call(f"projects/{project_id}/merge_requests?state=opened&source_branch={urllib.parse.quote(source_branch, safe='')}")
         
-        def run_bulk():
-            logs = []
-            try:
-                logs.append({'level': 'INFO', 'message': f'Creating MRs for {len(project_ids)} projects'})
-                
-                for pid in project_ids:
-                    p_name = PROJECT_NAMES.get(pid, f"Project {pid}")
-                    logs.append({'level': 'INFO', 'message': f'Processing {p_name}'})
-                    
-                    result = ms.create_mr_for_project(pid, p_name, {'snapshots': []})
-                    
-                    if result['success']:
-                        logs.append({'level': 'SUCCESS', 'message': f'MR created for {p_name}'})
-                        add_project_to_history(pid, p_name, 'mr', 'success', {'url': result.get('url')})
-                    else:
-                        logs.append({'level': 'ERROR', 'message': f'Failed for {p_name}'})
-                        add_project_to_history(pid, p_name, 'mr', 'failed')
-                
-                logs.append({'level': 'INFO', 'message': 'Bulk MR creation completed'})
-                active_tasks[task_id] = {
-                    'status': 'completed',
-                    'message': 'Bulk MR completed',
-                    'logs': logs
-                }
-                
-            except Exception as e:
-                logs.append({'level': 'ERROR', 'message': f'Error: {str(e)}'})
-                active_tasks[task_id] = {
-                    'status': 'failed',
-                    'message': str(e),
-                    'logs': logs
-                }
+        if existing_mrs and len(existing_mrs) > 0:
+            return jsonify({
+                'success': True,
+                'mr_url': existing_mrs[0].get('web_url'),
+                'message': 'MR already exists'
+            })
         
-        thread = threading.Thread(target=run_bulk)
-        thread.daemon = True
-        thread.start()
-        
-        active_tasks[task_id] = {
-            'status': 'running',
-            'message': 'Creating MRs...',
-            'logs': []
+        # Create MR
+        mr_payload = {
+            "source_branch": source_branch,
+            "target_branch": target_branch,
+            "title": title
         }
         
-        return jsonify({'success': True, 'task_id': task_id})
+        mr_response = api_call(f"projects/{project_id}/merge_requests", "POST", mr_payload)
+        
+        if 'web_url' in mr_response:
+            return jsonify({
+                'success': True,
+                'mr_url': mr_response['web_url'],
+                'message': 'MR created successfully'
+            })
+        else:
+            return jsonify({'success': False, 'error': 'Failed to create MR'}), 500
+            
     except Exception as e:
+        logger.error(f"Error in create_merge_request: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
+@app.route('/api/tags/<int:project_id>', methods=['GET', 'POST'])
+def manage_tags(project_id):
+    """Get or create tags for deployment"""
+    if request.method == 'GET':
+        try:
+            tags = api_call(f"projects/{project_id}/repository/tags?per_page=100")
+            
+            # Filter deployment tags
+            deployment_tags = []
+            for tag in tags:
+                tag_name = tag.get('name', '').lower()
+                if any(env in tag_name for env in ['dev', 'test', 'performance']):
+                    deployment_tags.append({
+                        'name': tag.get('name'),
+                        'commit_id': tag.get('commit', {}).get('id', ''),
+                        'protected': tag.get('protected', False)
+                    })
+            
+            return jsonify({
+                'success': True,
+                'tags': deployment_tags
+            })
+        except Exception as e:
+            logger.error(f"Error getting tags: {e}")
+            return jsonify({'success': False, 'error': str(e)}), 500
+    
+    elif request.method == 'POST':
+        try:
+            data = request.get_json()
+            tag_name = data.get('tag_name')
+            ref = data.get('ref', FEATURE_BRANCH)
+            
+            if not tag_name:
+                return jsonify({'success': False, 'error': 'Missing tag_name'}), 400
+            
+            # Delete existing tag if exists
+            try:
+                api_call(f"projects/{project_id}/repository/tags/{urllib.parse.quote(tag_name, safe='')}", "DELETE")
+            except:
+                pass
+            
+            # Create new tag
+            tag_response = api_call(
+                f"projects/{project_id}/repository/tags",
+                "POST",
+                {"tag_name": tag_name, "ref": ref}
+            )
+            
+            if 'name' in tag_response:
+                return jsonify({
+                    'success': True,
+                    'commit_sha': tag_response.get('commit', {}).get('id', ''),
+                    'message': f'Tag {tag_name} created successfully'
+                })
+            else:
+                return jsonify({'success': False, 'error': 'Failed to create tag'}), 500
+                
+        except Exception as e:
+            logger.error(f"Error creating tag: {e}")
+            return jsonify({'success': False, 'error': str(e)}), 500
 
-@app.route('/api/tasks/<task_id>', methods=['GET'])
-def get_task(task_id):
-    if task_id in active_tasks:
-        return jsonify({'success': True, 'task': active_tasks[task_id]})
-    else:
-        return jsonify({'success': False, 'error': 'Task not found'}), 404
+@app.route('/api/pipelines/<int:project_id>', methods=['GET'])
+def get_pipelines(project_id):
+    """Get pipeline status for a project"""
+    try:
+        ref = request.args.get('ref', FEATURE_BRANCH)
+        
+        pipelines = api_call(f"projects/{project_id}/pipelines?ref={urllib.parse.quote(ref, safe='')}&per_page=1")
+        
+        if pipelines and len(pipelines) > 0:
+            latest_pipeline = pipelines[0]
+            return jsonify({
+                'success': True,
+                'pipeline': {
+                    'id': latest_pipeline.get('id'),
+                    'status': latest_pipeline.get('status'),
+                    'ref': latest_pipeline.get('ref'),
+                    'sha': latest_pipeline.get('sha'),
+                    'web_url': latest_pipeline.get('web_url'),
+                    'created_at': latest_pipeline.get('created_at'),
+                    'updated_at': latest_pipeline.get('updated_at')
+                }
+            })
+        else:
+            return jsonify({
+                'success': True,
+                'pipeline': None
+            })
+            
+    except Exception as e:
+        logger.error(f"Error getting pipelines: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
+@app.route('/api/deploy', methods=['POST'])
+def trigger_deployment():
+    """Trigger manual deployment job"""
+    try:
+        data = request.get_json()
+        project_id = data.get('project_id')
+        pipeline_id = data.get('pipeline_id')
+        job_name = data.get('job_name')
+        
+        if not all([project_id, pipeline_id, job_name]):
+            return jsonify({'success': False, 'error': 'Missing required parameters'}), 400
+        
+        # Get jobs for pipeline
+        jobs = api_call(f"projects/{project_id}/pipelines/{pipeline_id}/jobs?per_page=100")
+        
+        # Find the job
+        target_job = None
+        for job in jobs:
+            if job.get('name') == job_name:
+                target_job = job
+                break
+        
+        if not target_job:
+            return jsonify({'success': False, 'error': f'Job {job_name} not found'}), 404
+        
+        # Trigger the job
+        job_id = target_job.get('id')
+        job_response = api_call(f"projects/{project_id}/jobs/{job_id}/play", "POST")
+        
+        if 'id' in job_response:
+            return jsonify({
+                'success': True,
+                'job_id': job_response.get('id'),
+                'status': job_response.get('status'),
+                'message': f'Job {job_name} triggered successfully'
+            })
+        else:
+            return jsonify({'success': False, 'error': 'Failed to trigger job'}), 500
+            
+    except Exception as e:
+        logger.error(f"Error triggering deployment: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
-def generate_diff(old_content, new_content):
-    import difflib
-    old_lines = old_content.splitlines(keepends=True)
-    new_lines = new_content.splitlines(keepends=True)
-    diff = ''.join(difflib.unified_diff(old_lines, new_lines, fromfile='before', tofile='after', lineterm=''))
-    return diff
+@app.route('/api/logs', methods=['GET'])
+def get_logs():
+    """Get list of available log files"""
+    try:
+        log_dirs = ['migration_logs', 'rollback_logs', 'state_logs']
+        all_logs = []
+        
+        for log_dir in log_dirs:
+            if os.path.exists(log_dir):
+                for filename in os.listdir(log_dir):
+                    if filename.endswith('.log') or filename.endswith('.json'):
+                        filepath = os.path.join(log_dir, filename)
+                        stat = os.stat(filepath)
+                        all_logs.append({
+                            'name': filename,
+                            'path': filepath,
+                            'size_kb': round(stat.st_size / 1024, 2),
+                            'timestamp': datetime.datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                            'date': datetime.datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S')
+                        })
+        
+        return jsonify({
+            'success': True,
+            'logs': sorted(all_logs, key=lambda x: x['timestamp'], reverse=True)
+        })
+    except Exception as e:
+        logger.error(f"Error getting logs: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
+@app.route('/api/logs/<path:log_path>', methods=['GET'])
+def get_log_content(log_path):
+    """Get content of a specific log file"""
+    try:
+        if not os.path.exists(log_path):
+            return jsonify({'success': False, 'error': 'Log file not found'}), 404
+        
+        with open(log_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        return jsonify({
+            'success': True,
+            'content': content
+        })
+    except Exception as e:
+        logger.error(f"Error reading log: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint"""
+    return jsonify({
+        'status': 'healthy',
+        'gitlab_url': BASE_URL,
+        'token_configured': bool(TOKEN),
+        'projects_count': len(PROJECT_NAMES)
+    })
 
 if __name__ == '__main__':
-    print("=" * 60)
-    print("  GitLab Migration Tool - Enhanced Version")
-    print("  Server running on http://localhost:5000")
-    print("  Logs saved to project_state.json")
-    print("=" * 60)
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    if not TOKEN:
+        logger.error("GitLab token not configured. Please set GITLAB_TOKEN in .env file")
+    if not BASE_URL:
+        logger.error("GitLab base URL not configured. Please set GITLAB_BASE_URL in .env file")
+    
+    logger.info(f"GitLab URL: {BASE_URL}")
+    logger.info(f"Projects configured: {len(PROJECT_NAMES)}")
+    logger.info(f"Feature branch: {FEATURE_BRANCH}")
+    logger.info(f"Source branch: {SOURCE_BRANCH}")
+    
+    app.run(host='0.0.0.0', port=5000, debug=True)
