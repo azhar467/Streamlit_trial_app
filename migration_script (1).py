@@ -673,7 +673,12 @@ def api_call(endpoint, method="GET", data=None):
         status_code = response.status_code
         response_body = response.text if status_code >= 400 else None
         write_audit_entry(method, url, status_code, response_body)
-        if status_code == 429 or (500 <= status_code <= 599):
+        if status_code == 429:
+            retry_after = int(response.headers.get("Retry-After", 60))
+            log(f"Rate limited (HTTP 429) on {url}. Waiting {retry_after}s before retry...", "WARN")
+            time.sleep(retry_after)
+            raise RuntimeError(f"HTTP 429 rate limit for {url}")
+        if 500 <= status_code <= 599:
             raise RuntimeError(f"HTTP {status_code} returned for {url}")
         if not response.text:
             return {}
@@ -1037,12 +1042,8 @@ def create_mr_for_project(pid, p_name, rollback_data):
         return {"success": False, "idempotent": False, "url": None}
     br_check = api_call(f"projects/{pid}/repository/branches/{quote(FEATURE_BRANCH, safe='')}")
     if not (isinstance(br_check, dict) and "name" in br_check):
-        log(f"Feature branch '{FEATURE_BRANCH}' does not exist for {p_name}. Creating it...", "WARN")
-        branch_created = create_feature_branch(pid, p_name)
-        if not branch_created:
-            log(f"[ERROR] Cannot create MR without feature branch for {p_name}", "ERROR")
-            return {"success": False, "idempotent": False, "url": None}
-        br_check = api_call(f"projects/{pid}/repository/branches/{quote(FEATURE_BRANCH, safe='')}")
+        log(f"Feature branch '{FEATURE_BRANCH}' does not exist for {p_name}; skipping MR", "WARN")
+        return {"success": False, "idempotent": False, "url": None, "skipped_no_branch": True}
     log(f"Checking if MR already exists for {FEATURE_BRANCH}...", "INFO")
     try:
         existing = api_call(f"projects/{pid}/merge_requests?state=opened&source_branch={quote(FEATURE_BRANCH, safe='')}")
@@ -1054,7 +1055,13 @@ def create_mr_for_project(pid, p_name, rollback_data):
         return {"success": False, "idempotent": False, "url": None}
     if has_open_mr:
         try:
-            existing_url = existing[0].get("web_url", "unknown")
+            existing_mr = existing[0]
+            existing_url = existing_mr.get("web_url", "unknown")
+            merge_status = existing_mr.get("merge_status", "")
+            if merge_status == "cannot_be_merged":
+                log(f"[WARN] Existing MR has conflicts and cannot be merged: {existing_url}", "WARN")
+                log(f"[WARN] Manual conflict resolution is required for {p_name}", "WARN")
+                return {"success": True, "idempotent": True, "url": existing_url, "mr_conflict": True}
             log(f"[IDEMPOTENT] MR already exists: {existing_url}", "INFO")
             return {"success": True, "idempotent": True, "url": existing_url}
         except Exception:
@@ -1118,6 +1125,8 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
         "committed": False,
         "deployed": False,
         "mr_created": False,
+        "skipped_mr": False,
+        "mr_conflict": False,
         "error": None,
         "interrupted": False,
         "idempotent_commit": False,
@@ -1128,10 +1137,18 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
         if mode == "mr_only":
             mr_result = create_mr_for_project(pid, p_name, rollback_data)
             result["mr_created"] = mr_result["success"]
-            result["idempotent_mr"] = mr_result["idempotent"]
-            result["success"] = mr_result["success"]
+            result["idempotent_mr"] = mr_result.get("idempotent", False)
+            result["mr_conflict"] = mr_result.get("mr_conflict", False)
+            is_skipped = mr_result.get("skipped_empty") or mr_result.get("skipped_no_branch")
+            result["skipped_mr"] = bool(is_skipped)
+            if is_skipped:
+                result["success"] = True
+            else:
+                result["success"] = mr_result["success"]
             if state is not None:
-                if mr_result["success"]:
+                if is_skipped:
+                    state["skipped_projects"].append(pid)
+                elif mr_result["success"]:
                     state["completed_projects"].append(pid)
                 else:
                     state["failed_projects"].append(pid)
@@ -1331,8 +1348,14 @@ def process_project(pid, choices=None, show_full=True, rollback_data=None, mode=
             if choice == "2":
                 mr_result = create_mr_for_project(pid, p_name, rollback_data)
                 result["mr_created"] = mr_result["success"]
-                result["idempotent_mr"] = mr_result["idempotent"]
-                result["success"] = result["committed"] or mr_result["success"]
+                result["idempotent_mr"] = mr_result.get("idempotent", False)
+                result["mr_conflict"] = mr_result.get("mr_conflict", False)
+                is_skipped = mr_result.get("skipped_empty") or mr_result.get("skipped_no_branch")
+                result["skipped_mr"] = bool(is_skipped)
+                if is_skipped:
+                    result["success"] = result["committed"] or True
+                else:
+                    result["success"] = result["committed"] or mr_result["success"]
             elif choice == "3":
                 log(f"Skipping deployment/MR for {p_name}", "INFO")
                 result["success"] = result["committed"]
@@ -1492,7 +1515,19 @@ def handle_deployment(pid, p_name, state=None):
             if deploy_job_name:
                 jobs = get_pipeline_jobs(pid, pipeline_id)
                 deploy_job = find_job_by_name(jobs, deploy_job_name)
-                if deploy_job and deploy_job.get("status") == "manual":
+                if deploy_job is None:
+                    log(f"[ERROR] Job '{deploy_job_name}' not found in pipeline {pipeline_id} for tag '{tag_name}'; deployment aborted", "ERROR")
+                    if state is not None:
+                        if str(pid) not in state["project_details"]:
+                            state["project_details"][str(pid)] = {
+                                "completed_tags": [],
+                                "failed_tags": [],
+                                "last_pipeline_id": None
+                            }
+                        state["project_details"][str(pid)]["failed_tags"].append(tag_name)
+                        save_state(state)
+                    continue
+                if deploy_job.get("status") == "manual":
                     log(f"Triggering '{deploy_job_name}' job...", "INFO")
                     trigger_manual_job(pid, deploy_job.get("id"))
                     deploy_result = wait_for_job_completion(pid, deploy_job.get("id"), timeout=1200)
@@ -1524,6 +1559,8 @@ def handle_deployment(pid, p_name, state=None):
                                 }
                             state["project_details"][str(pid)]["failed_tags"].append(tag_name)
                             save_state(state)
+                else:
+                    log(f"[WARN] Job '{deploy_job_name}' exists but is not in manual status (status: {deploy_job.get('status', 'unknown')}); skipping trigger", "WARN")
         else:
             log(f"No commit available for tag '{tag_name}', skipping deployment", "WARN")
     return {"success": deployment_successful, "idempotent_tags": idempotent_tags}
@@ -1731,7 +1768,7 @@ def print_summary_table(project_results):
     col_name = max((len(r.get("project_name", "")) for r in project_results), default=20)
     col_name = max(col_name, len("Project Name"))
     col_commit = len("Commit Status")
-    col_mr = len("MR Status")
+    col_mr = max(len("MR Status"), len("Skipped (No Changes/Branch)"), len("Conflict - Manual Fix Needed"))
     header = (
         f"{'Project Name':<{col_name}}  "
         f"{'Commit Status':<{col_commit}}  "
@@ -1755,6 +1792,10 @@ def print_summary_table(project_results):
             commit_status = "Not attempted"
         if r.get("interrupted"):
             mr_status = "Interrupted"
+        elif r.get("mr_conflict"):
+            mr_status = "Conflict - Manual Fix Needed"
+        elif r.get("skipped_mr"):
+            mr_status = "Skipped (No Changes/Branch)"
         elif r.get("idempotent_mr"):
             mr_status = "Exists"
         elif r.get("mr_created"):
