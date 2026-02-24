@@ -23,11 +23,254 @@ ms.NEW_DEFAULT_PLATFORM = env_config['new_default_platform']
 ms.REVIEWER_USERNAMES = env_config['reviewer_usernames']
 ms.ASSIGNEE_USERNAMES = env_config['assignee_usernames']
 
+
+def _read_env_file_robust():
+    """
+    Read the .env file with full robustness:
+      - Handles UTF-8 BOM (added silently by Windows Notepad)
+      - Handles CRLF and LF line endings
+      - Accepts both  KEY=VALUE  and  KEY = VALUE  forms
+      - Strips surrounding quotes from values
+    Returns dict of all parsed key→value pairs (raw, uppercased keys).
+    """
+    env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+    result = {}
+    if not os.path.exists(env_file):
+        print(f"[ENV] .env not found at {env_file}")
+        return result
+    try:
+        # utf-8-sig strips the BOM if present; utf-8 is fine if not
+        with open(env_file, encoding='utf-8-sig', errors='replace') as f:
+            raw = f.read()
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            k, v = line.split('=', 1)
+            k = k.strip().upper()
+            v = v.strip()
+            # Strip surrounding quotes
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+                v = v[1:-1]
+            result[k] = v
+        print(f"[ENV] Parsed {len(result)} keys from .env: {', '.join(sorted(result.keys()))}")
+    except Exception as ex:
+        print(f"[ENV] Error reading .env: {ex}")
+    return result
+
+
+def _apply_env_dict(env_dict):
+    """Apply parsed .env dict to ms.* globals and PROJECT_NAMES."""
+    global PROJECT_NAMES
+    token_keys   = ('GITLAB_TOKEN', 'TOKEN')
+    base_keys    = ('BASE_URL', 'GITLAB_BASE_URL', 'GITLAB_URL')
+    for k in token_keys:
+        if env_dict.get(k):
+            ms.TOKEN = env_dict[k]
+            print(f"[ENV] TOKEN set from key '{k}' (length={len(ms.TOKEN)})")
+            break
+    for k in base_keys:
+        if env_dict.get(k):
+            ms.BASE_URL = env_dict[k].rstrip('/')
+            print(f"[ENV] BASE_URL set from key '{k}': {ms.BASE_URL}")
+            break
+    if env_dict.get('NEW_DEFAULT_PLATFORM'):
+        ms.NEW_DEFAULT_PLATFORM = env_dict['NEW_DEFAULT_PLATFORM']
+    if env_dict.get('REVIEWER_USERNAMES'):
+        ms.REVIEWER_USERNAMES = [x.strip() for x in env_dict['REVIEWER_USERNAMES'].split(',') if x.strip()]
+    if env_dict.get('ASSIGNEE_USERNAMES'):
+        ms.ASSIGNEE_USERNAMES = [x.strip() for x in env_dict['ASSIGNEE_USERNAMES'].split(',') if x.strip()]
+    if env_dict.get('GITLAB_VERIFY_SSL'):
+        ms.SSL_VERIFY = env_dict['GITLAB_VERIFY_SSL'].lower() != 'false'
+    # Actuator URLs (DEV / TEST / plain)
+    for k, v in env_dict.items():
+        if k.startswith('ACTUATOR_'):
+            rest = k[len('ACTUATOR_'):]
+            if rest.endswith('_DEV'):
+                pid = rest[:-4]
+                if pid.isdigit():
+                    env_config.setdefault('actuator_urls_dev', {})[pid] = v.rstrip('/')
+            elif rest.endswith('_TEST'):
+                pid = rest[:-5]
+                if pid.isdigit():
+                    env_config.setdefault('actuator_urls_test', {})[pid] = v.rstrip('/')
+            elif rest.isdigit():
+                env_config.setdefault('actuator_urls', {})[rest] = v.rstrip('/')
+    # Projects
+    new_projects = {int(k.replace('PROJECT_', '')): v
+                    for k, v in env_dict.items()
+                    if k.startswith('PROJECT_') and k[8:].isdigit()}
+    if new_projects:
+        PROJECT_NAMES = new_projects
+        print(f"[ENV] Loaded {len(PROJECT_NAMES)} project(s)")
+
+
+# ── Robust fallback: if migration_script couldn't read the token (e.g. BOM),
+#    read the .env ourselves with BOM-safe encoding and patch the globals.
+if not ms.TOKEN:
+    print("[ENV] migration_script returned empty token — attempting BOM-safe fallback read")
+    _fallback_env = _read_env_file_robust()
+    if _fallback_env:
+        _apply_env_dict(_fallback_env)
+        if ms.TOKEN:
+            print(f"[ENV] Fallback read succeeded — token loaded (length={len(ms.TOKEN)})")
+        else:
+            print("[ENV] WARNING: fallback read found no token either — check GITLAB_TOKEN in .env")
+    # Store for diagnostics
+    env_config['_raw_env'] = _fallback_env
+else:
+    # Even when migration_script succeeded, do a BOM-safe read to cover projects/extra keys
+    _fallback_env = _read_env_file_robust()
+    env_config['_raw_env'] = _fallback_env
+    print(f"[ENV] Token loaded via migration_script (length={len(ms.TOKEN)})")
+
+
+def _load_extended_env_config():
+    """Parse additional .env keys not handled by migration_script.load_env_config:
+      ACTUATOR_<project_id>   = https://my-app.internal/actuator
+      PARENT_POM_PROJECT_ID   = 999  (GitLab project ID of the parent pom repo)
+    """
+    extra = {'actuator_urls': {}, 'actuator_urls_dev': {}, 'actuator_urls_test': {}, 'parent_pom_project_id': None}
+    env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+    if not os.path.exists(env_file):
+        return extra
+    try:
+        with open(env_file, encoding='utf-8-sig', errors='replace') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                k, v = line.split('=', 1)
+                k, v = k.strip().upper(), v.strip().strip('"\'')
+                if k.startswith('ACTUATOR_'):
+                    rest = k[len('ACTUATOR_'):]
+                    if rest.endswith('_DEV'):
+                        pid = rest[:-4]
+                        if pid.isdigit():
+                            extra['actuator_urls_dev'][pid] = v.rstrip('/')
+                    elif rest.endswith('_TEST'):
+                        pid = rest[:-5]
+                        if pid.isdigit():
+                            extra['actuator_urls_test'][pid] = v.rstrip('/')
+                    elif rest.isdigit():
+                        # Plain ACTUATOR_<id> counts as both dev and test fallback
+                        extra['actuator_urls'][rest] = v.rstrip('/')
+                elif k == 'PARENT_POM_PROJECT_ID' and v.isdigit():
+                    extra['parent_pom_project_id'] = int(v)
+    except Exception as ex:
+        print(f"[WARN] _load_extended_env_config: {ex}")
+    return extra
+
+_ext_config = _load_extended_env_config()
+# Attach to env_config dict so /api/reload-config can refresh them together
+env_config['actuator_urls']      = _ext_config['actuator_urls']
+env_config['actuator_urls_dev']  = _ext_config['actuator_urls_dev']
+env_config['actuator_urls_test'] = _ext_config['actuator_urls_test']
+env_config['parent_pom_project_id'] = _ext_config['parent_pom_project_id']
+
+# CRITICAL: setup_http_session() is only called in the CLI __main__ block.
+# Flask never hits __main__, so HTTP_SESSION stays None and every api_call
+# fails with AttributeError then retries 3x (1s+2s+4s = ~7s per call).
+# We must initialise the session here so Flask requests work immediately.
+_ssl_verify = env_config.get('ssl_verify')
+if _ssl_verify is None:
+    _ssl_verify = True
+ms.SSL_VERIFY = _ssl_verify
+ms.setup_http_session(ssl_verify=_ssl_verify)
+print(f"[INFO] HTTP session initialised (ssl_verify={_ssl_verify}, token_set={bool(ms.TOKEN)})")
+
 active_tasks = {}
 project_history = []
 pipeline_status = {}  # Track pipeline status per project
+project_interrupt_flags = {}  # Per-project stop signals: {project_id: threading.Event}
+
+# ── Concurrency / Queue Control ───────────────────────────────────────────────
+MAX_CONCURRENT = int(os.environ.get('MAX_CONCURRENT_MIGRATIONS', '3'))
+_migration_semaphore = threading.Semaphore(MAX_CONCURRENT)
+
+# _queue_state: keyed by str(project_id)
+# Each entry: {'position': int, 'status': 'queued'|'running'|'done'|'cancelled', 'cancel_event': Event}
+_queue_state: dict = {}
+_queue_lock = threading.Lock()
+_queue_counter = 0  # monotonic ticket number
+
+# Circuit breaker
+_cb_state = {
+    'paused': False,
+    'consecutive_failures': 0,
+    'THRESHOLD': 2,
+    'resume_event': threading.Event(),
+}
+_cb_state['resume_event'].set()  # starts unpaused
+
+
+def _queue_register(pid_str: str) -> threading.Event:
+    """Assign a queue ticket. Returns a cancel_event the caller can set to abort."""
+    global _queue_counter
+    with _queue_lock:
+        _queue_counter += 1
+        cancel_ev = threading.Event()
+        _queue_state[pid_str] = {
+            'position': _queue_counter,
+            'status': 'queued',
+            'cancel_event': cancel_ev,
+        }
+    return cancel_ev
+
+
+def _queue_acquire(pid_str: str) -> bool:
+    """Block until a semaphore slot is available (or cancelled). Returns False if cancelled."""
+    state = _queue_state.get(pid_str)
+    if not state:
+        return True  # untracked — proceed immediately
+
+    cancel_ev = state['cancel_event']
+
+    # Wait if circuit breaker is paused (up to 5 min before auto-continuing)
+    _cb_state['resume_event'].wait(timeout=300)
+
+    # Poll for semaphore while checking cancel
+    while True:
+        if cancel_ev.is_set():
+            with _queue_lock:
+                if pid_str in _queue_state:
+                    _queue_state[pid_str]['status'] = 'cancelled'
+            return False
+        acquired = _migration_semaphore.acquire(blocking=False)
+        if acquired:
+            with _queue_lock:
+                if pid_str in _queue_state:
+                    _queue_state[pid_str]['status'] = 'running'
+            return True
+        time.sleep(0.5)
+
+
+def _queue_release(pid_str: str, succeeded: bool):
+    """Release semaphore and update circuit breaker."""
+    _migration_semaphore.release()
+    with _queue_lock:
+        if pid_str in _queue_state:
+            _queue_state[pid_str]['status'] = 'done'
+
+    if succeeded:
+        _cb_state['consecutive_failures'] = 0
+    else:
+        _cb_state['consecutive_failures'] += 1
+        if _cb_state['consecutive_failures'] >= _cb_state['THRESHOLD']:
+            _cb_state['paused'] = True
+            _cb_state['resume_event'].clear()
+            print(f"[CIRCUIT-BREAKER] Paused after {_cb_state['consecutive_failures']} consecutive failures")
+# ─────────────────────────────────────────────────────────────────────────────
 STATE_FILE = 'project_state.json'
-PIPELINE_FILE = 'pipeline_state.json'
+
+# ── Directory enforcement (req §4) ────────────────────────────────────────────
+# PIPELINE_FILE must always live under state_logs/ — never in the root directory.
+# We create state_logs/ here at module load time so it exists before any function
+# tries to read or write PIPELINE_FILE, even on a completely fresh checkout.
+_STATE_LOGS_DIR = 'state_logs'
+os.makedirs(_STATE_LOGS_DIR, exist_ok=True)
+PIPELINE_FILE = os.path.join(_STATE_LOGS_DIR, 'pipeline_state.json')
+# ──────────────────────────────────────────────────────────────────────────────
 
 def load_project_state():
     global project_history
@@ -46,6 +289,11 @@ def save_project_state():
 
 def load_pipeline_state():
     global pipeline_status
+    # Double-check directory exists before every load (handles edge-case where
+    # the directory was removed while the server was running)
+    os.makedirs(_STATE_LOGS_DIR, exist_ok=True)
+    assert PIPELINE_FILE == os.path.join(_STATE_LOGS_DIR, 'pipeline_state.json'), \
+        f"PIPELINE_FILE path drift detected: {PIPELINE_FILE}"
     if os.path.exists(PIPELINE_FILE):
         try:
             with open(PIPELINE_FILE, 'r') as f:
@@ -78,18 +326,32 @@ def add_project_to_history(project_id, project_name, action, status, details=Non
         project_history = project_history[:100]
     save_project_state()
 
-def update_pipeline_status(project_id, status, pipeline_id=None, commit_sha=None, committer_name=None, commit_message=None, workflow_stage=None):
+def update_pipeline_status(project_id, status, pipeline_id=None, commit_sha=None, committer_name=None, commit_message=None, workflow_stage=None, path_with_namespace=None, pipeline_started_at=None):
     """Update pipeline status for a project, preserving existing details if not provided"""
     existing = pipeline_status.get(str(project_id), {})
+    # Set pipeline_started_at only when a new pipeline_id is first registered (running state)
+    new_pipeline_id = pipeline_id if pipeline_id is not None else existing.get('pipeline_id')
+    old_pipeline_id = existing.get('pipeline_id')
+    if pipeline_started_at is not None:
+        effective_pipeline_started_at = pipeline_started_at
+    elif new_pipeline_id and new_pipeline_id != old_pipeline_id and status == 'running':
+        effective_pipeline_started_at = datetime.now().isoformat()
+    else:
+        effective_pipeline_started_at = existing.get('pipeline_started_at')
+
     pipeline_status[str(project_id)] = {
         'status': status,
-        'pipeline_id': pipeline_id if pipeline_id is not None else existing.get('pipeline_id'),
+        'pipeline_id': new_pipeline_id,
         'commit_sha': commit_sha if commit_sha is not None else existing.get('commit_sha'),
         'committer_name': committer_name if committer_name is not None else existing.get('committer_name', 'Unknown'),
         'commit_message': commit_message if commit_message is not None else existing.get('commit_message', ''),
         'timestamp': existing.get('timestamp') if status in ('success', 'failed') and existing.get('timestamp') else datetime.now().isoformat(),
         # Workflow stage: idle → committed → pipeline_success → deployed → mr_raised → merged
-        'workflow_stage': workflow_stage if workflow_stage is not None else existing.get('workflow_stage', 'idle')
+        'workflow_stage': workflow_stage if workflow_stage is not None else existing.get('workflow_stage', 'idle'),
+        # Full GitLab path (e.g. "my-group/my-subgroup/project") for building correct web URLs
+        'path_with_namespace': path_with_namespace if path_with_namespace is not None else existing.get('path_with_namespace', ''),
+        # ISO timestamp for when the *specific pipeline* started (used for live timer in UI)
+        'pipeline_started_at': effective_pipeline_started_at,
     }
     save_pipeline_state()
     print(f"[PIPELINE] Updated status for project {project_id}: {status} (stage: {pipeline_status[str(project_id)]['workflow_stage']})")
@@ -97,10 +359,14 @@ def update_pipeline_status(project_id, status, pipeline_id=None, commit_sha=None
 load_project_state()
 load_pipeline_state()
 
-# Ensure log directories exist
-for log_dir in ['migration_logs', 'rollback_logs', 'state_logs']:
-    os.makedirs(log_dir, exist_ok=True)
-    print(f"[INFO] Ensured log directory exists: {log_dir}")
+# ── Ensure ALL log directories exist at startup ───────────────────────────────
+# state_logs is already created above, but we re-assert here to keep the list
+# complete and explicit.  exist_ok=True makes this a safe no-op on restarts.
+_LOG_DIRS = ['migration_logs', 'rollback_logs', 'state_logs', 'api_audit_logs']
+for _log_dir in _LOG_DIRS:
+    os.makedirs(_log_dir, exist_ok=True)
+    print(f"[INIT] Log directory ready: {_log_dir}/")
+# ──────────────────────────────────────────────────────────────────────────────
 
 # Initialize file logging
 try:
@@ -108,6 +374,13 @@ try:
     print(f"[INFO] File logging initialized: {log_file}")
 except Exception as e:
     print(f"[WARN] Could not initialize file logging: {e}")
+
+# Initialize API audit logging
+try:
+    ms.setup_api_audit_logging()
+    print(f"[INFO] API audit logging initialized: {ms.AUDIT_LOG_FILE}")
+except Exception as e:
+    print(f"[WARN] Could not initialize API audit logging: {e}")
 
 def recheck_running_pipelines():
     """On startup, re-check any pipelines saved as 'running' to get their actual status"""
@@ -139,6 +412,24 @@ def recheck_running_pipelines():
 threading.Thread(target=recheck_running_pipelines, daemon=True).start()
 
 
+
+def _build_feature_branch(branch_num, branch_prefix=None, branch_suffix=None):
+    """Build feature branch name from components, with sensible defaults."""
+    prefix = branch_prefix or 'task-'
+    suffix = branch_suffix or 'java17-migration'
+    return f"{prefix}{branch_num}-{suffix}"
+
+
+def _resolve_source_branch(project_id):
+    """Return the first existing branch in: develop → master → main.
+    Falls back to 'develop' if none can be verified (avoids blocking callers)."""
+    for candidate in ('develop', 'master', 'main'):
+        resp = ms.api_call(f"projects/{project_id}/repository/branches/{urllib.parse.quote(candidate, safe='')}")
+        if isinstance(resp, dict) and resp.get('name'):
+            return candidate
+    return 'develop'  # last-resort fallback
+
+
 @app.route('/')
 def index():
     try:
@@ -158,22 +449,108 @@ def favicon():
 @app.route('/api/config', methods=['GET'])
 def get_config():
     """Get configuration from .env file"""
-    # Return data at top level for easier access in JavaScript
+    # Get token info
+    token_info = {'valid': False, 'reason': 'unknown'}
+    try:
+        if not ms.TOKEN or ms.TOKEN.strip() == '':
+            token_info['reason'] = 'no_token'
+        elif not ms.BASE_URL or ms.BASE_URL.strip() == '':
+            token_info['reason'] = 'no_base_url'
+        elif ms.HTTP_SESSION is None:
+            token_info['reason'] = 'session_not_initialised'
+        else:
+            user_resp = ms.api_call('user')
+            if isinstance(user_resp, dict) and not user_resp.get('error'):
+                token_info['valid'] = True
+                token_info['reason'] = 'ok'
+                # Check token expiry if available — non-fatal if this call fails
+                try:
+                    token_resp = ms.api_call('personal_access_tokens/self')
+                    if isinstance(token_resp, dict) and 'expires_at' in token_resp:
+                        token_info['expires_at'] = token_resp['expires_at']
+                except Exception:
+                    pass
+            else:
+                err_detail = user_resp.get('details', '') if isinstance(user_resp, dict) else ''
+                if '401' in err_detail or 'Unauthorized' in err_detail:
+                    token_info['reason'] = 'invalid'
+                elif '404' in err_detail or 'Not Found' in err_detail:
+                    token_info['reason'] = 'wrong_base_url'
+                else:
+                    token_info['reason'] = 'invalid'
+    except Exception as _e:
+        _emsg = str(_e)
+        if 'NoneType' in _emsg or 'session' in _emsg.lower():
+            token_info['reason'] = 'session_not_initialised'
+        elif 'Connection' in _emsg or 'timeout' in _emsg.lower() or 'refused' in _emsg.lower():
+            token_info['reason'] = 'connection_error'
+        else:
+            token_info['reason'] = 'connection_error'
+    
+    # Fetch path_with_namespace for each project in parallel so we don't
+    # pay an N×RTT serial penalty on every Load Config click.
+    import concurrent.futures
+
+    def _fetch_project_path(pid_pname):
+        pid, pname = pid_pname
+        try:
+            proj_resp = ms.api_call(f"projects/{pid}")
+            if isinstance(proj_resp, dict) and not proj_resp.get('error'):
+                path = proj_resp.get('path_with_namespace') or pname
+            else:
+                path = pname
+        except Exception:
+            path = pname
+        return {'id': pid, 'name': pname, 'path_with_namespace': path}
+
+    projects = []
+    if PROJECT_NAMES:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(PROJECT_NAMES))) as ex:
+            results = list(ex.map(_fetch_project_path, PROJECT_NAMES.items()))
+        projects = results
+
+
     return jsonify({
         'success': True,
         'base_url': ms.BASE_URL,
-        'projects': [
-            {
-                'id': pid,
-                'name': pname,
-                'path_with_namespace': pname  # Provide a default path
-            } 
-            for pid, pname in PROJECT_NAMES.items()
-        ],
+        'projects': projects,
         'assignees': ms.ASSIGNEE_USERNAMES,
         'reviewers': ms.REVIEWER_USERNAMES,
-        'new_default_platform': ms.NEW_DEFAULT_PLATFORM
+        'new_default_platform': ms.NEW_DEFAULT_PLATFORM,
+        'token_info': token_info,
+        'actuator_urls_dev':   list(env_config.get('actuator_urls_dev',  {}).keys()),
+        'actuator_urls_test':  list(env_config.get('actuator_urls_test', {}).keys()),
+        'actuator_urls_plain': list(env_config.get('actuator_urls',      {}).keys()),
     })
+
+
+@app.route('/api/token/refresh', methods=['POST'])
+def refresh_token_info():
+    """Refresh GitLab token information"""
+    try:
+        token_info = {'valid': False, 'reason': 'unknown'}
+        if not ms.TOKEN or ms.TOKEN.strip() == '':
+            token_info['reason'] = 'no_token'
+        else:
+            user_resp = ms.api_call('user')
+            if isinstance(user_resp, dict) and not user_resp.get('error'):
+                token_info['valid'] = True
+                token_info['reason'] = 'ok'
+                token_info['username'] = user_resp.get('username', 'Unknown')
+                
+                # Get token expiry
+                token_resp = ms.api_call('personal_access_tokens/self')
+                if isinstance(token_resp, dict) and 'expires_at' in token_resp:
+                    token_info['expires_at'] = token_resp['expires_at']
+                    token_info['scopes'] = token_resp.get('scopes', [])
+            else:
+                token_info['reason'] = 'invalid'
+        return jsonify({
+            'success': True,
+            'token_info': token_info
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/api/projects/<int:project_id>/preview', methods=['POST'])
@@ -182,11 +559,11 @@ def preview_changes(project_id):
     try:
         data = request.json
         choices = data.get('choices', [])
-        branch_num = data.get('branch_num', '1293')
+        branch_num = data.get('branch_num', '12938')
         
         # Set branch configuration
         ms.JIRA_ID = branch_num
-        ms.FEATURE_BRANCH = f"task-{branch_num}-java17-migration"
+        ms.FEATURE_BRANCH = _build_feature_branch(branch_num, data.get("branch_prefix","task-"), data.get("branch_suffix","java17-migration"))
         
         # Get project info
         project_info = ms.api_call(f"projects/{project_id}")
@@ -296,11 +673,12 @@ def commit_project(project_id):
     try:
         data = request.json
         choices = data.get('choices', [])
-        branch_num = data.get('branch_num', '1293')
+        branch_num = data.get('branch_num', '12938')
+        custom_commit_message = (data.get('commit_message') or '').strip() or f"fix: java17-migration"
         
         # Set branch configuration
         ms.JIRA_ID = branch_num
-        ms.FEATURE_BRANCH = f"task-{branch_num}-java17-migration"
+        ms.FEATURE_BRANCH = _build_feature_branch(branch_num, data.get("branch_prefix","task-"), data.get("branch_suffix","java17-migration"))
         ms.MR_TITLE = f"TASK-{branch_num}: java migration"
         
         # Generate a unique task ID
@@ -314,270 +692,461 @@ def commit_project(project_id):
             'logs': []
         }
         
-        # Update pipeline status to "committing"
-        update_pipeline_status(project_id, 'committing')
+        # Update pipeline status to "committing" / queued
+        pid_str = str(project_id)
+        cancel_event = _queue_register(pid_str)
+        update_pipeline_status(project_id, 'queued')
         
         # Start background thread
         def commit_thread():
+            _acquired = False
+            _commit_succeeded = False
+            _message = custom_commit_message  # capture in closure
             try:
-                project_info = ms.api_call(f"projects/{project_id}")
-                p_name = project_info.get('name', f"ID:{project_id}") if isinstance(project_info, dict) else f"ID:{project_id}"
-                
-                active_tasks[task_id]['project_name'] = p_name
-                active_tasks[task_id]['logs'].append({
-                    'level': 'INFO',
-                    'message': f'Starting commit for {p_name}...',
-                    'timestamp': datetime.now().isoformat()
-                })
-                
-                # Check if branch exists, create if needed
-                br_check = ms.api_call(f"projects/{project_id}/repository/branches/{urllib.parse.quote(ms.FEATURE_BRANCH, safe='')}")
-                
-                if not (isinstance(br_check, dict) and "name" in br_check):
+                # ── Wait for a concurrency slot (or cancellation) ────────────
+                update_pipeline_status(project_id, 'queued')
+                ok = _queue_acquire(pid_str)
+                if not ok:
                     active_tasks[task_id]['logs'].append({
-                        'level': 'INFO',
-                        'message': f'Creating branch {ms.FEATURE_BRANCH}...',
+                        'level': 'WARN',
+                        'message': 'Migration cancelled while queued',
                         'timestamp': datetime.now().isoformat()
                     })
-                    ms.create_feature_branch(project_id, p_name)
-                
-                # Prepare commit actions
-                actions = []
-                current_ref = ms.FEATURE_BRANCH if isinstance(br_check, dict) and "name" in br_check else ms.SOURCE_BRANCH
-                files_to_backup = []
-                
-                if '1' in choices:  # POM
-                    res = ms.api_call(f"projects/{project_id}/repository/files/{urllib.parse.quote('pom.xml', safe='')}?ref={urllib.parse.quote(current_ref, safe='')}")
-                    if isinstance(res, dict) and "content" in res:
-                        orig = base64.b64decode(res['content']).decode('utf-8')
-                        upd = re.sub(r"<(java\.version|maven\.compiler\.(source|target|release))>11</\1>", r"<\1>17</\1>", orig)
-                        if "<parent>" in upd:
-                            upd = re.sub(r"<parent>[\s\S]*?</parent>", ms.update_parent_block, upd)
-                        if orig != upd:
-                            actions.append({"action": "update", "file_path": "pom.xml", "content": upd})
-                            files_to_backup.append('pom.xml')
-                
-                if '2' in choices:  # CI
-                    res = ms.api_call(f"projects/{project_id}/repository/files/{urllib.parse.quote('.gitlab-ci.yml', safe='')}?ref={urllib.parse.quote(current_ref, safe='')}")
-                    if isinstance(res, dict) and "content" in res:
-                        orig = base64.b64decode(res['content']).decode('utf-8')
-                        upd = re.sub(r"^\s*image:.*(\n|$)", "", orig, flags=re.MULTILINE)
-                        if orig != upd:
-                            actions.append({"action": "update", "file_path": ".gitlab-ci.yml", "content": upd})
-                            files_to_backup.append('.gitlab-ci.yml')
-                
-                if '3' in choices:  # EB Config
-                    path = urllib.parse.quote(".elasticbeanstalk/config.yml", safe='')
-                    res = ms.api_call(f"projects/{project_id}/repository/files/{path}?ref={urllib.parse.quote(current_ref, safe='')}")
-                    if isinstance(res, dict) and "content" in res:
-                        orig = base64.b64decode(res['content']).decode('utf-8')
-                        upd = re.sub(r"(default_platform:\s*).*$", f"default_platform: {ms.NEW_DEFAULT_PLATFORM}", orig, flags=re.MULTILINE)
-                        if orig != upd:
-                            actions.append({"action": "update", "file_path": ".elasticbeanstalk/config.yml", "content": upd})
-                            files_to_backup.append('.elasticbeanstalk/config.yml')
-                
-                if not actions:
-                    active_tasks[task_id]['logs'].append({
-                        'level': 'INFO',
-                        'message': 'No changes detected - files may already be updated',
-                        'timestamp': datetime.now().isoformat()
-                    })
-                    active_tasks[task_id]['status'] = 'no_changes'
-                    update_pipeline_status(project_id, 'no_changes')
-                    add_project_to_history(project_id, p_name, 'commit', 'no_changes')
+                    active_tasks[task_id]['status'] = 'cancelled'
+                    update_pipeline_status(project_id, 'cancelled')
                     return
-                
-                # Check if files already match
-                all_match, details = ms.check_files_already_match(project_id, actions, ms.FEATURE_BRANCH)
-                
-                if all_match:
-                    active_tasks[task_id]['logs'].append({
-                        'level': 'INFO',
-                        'message': 'All files already match desired state - skipping commit',
-                        'timestamp': datetime.now().isoformat()
-                    })
-                    active_tasks[task_id]['status'] = 'idempotent'
-                    update_pipeline_status(project_id, 'success')
-                    add_project_to_history(project_id, p_name, 'commit', 'idempotent')
-                    return
-                
-                # Save rollback snapshot before committing
+                _acquired = True
+                update_pipeline_status(project_id, 'committing')
+                # ─────────────────────────────────────────────────────────────
+
                 try:
-                    snapshot = ms.create_rollback_snapshot(project_id, p_name, current_ref, files_to_backup)
-                    rollback_data = {
-                        'project_id': project_id,
-                        'project_name': p_name,
-                        'branch': current_ref,
-                        'snapshots': [snapshot]
-                    }
-                    ms.save_rollback_data(rollback_data)
+                    project_info = ms.api_call(f"projects/{project_id}")
+                    p_name = project_info.get('name', f"ID:{project_id}") if isinstance(project_info, dict) else f"ID:{project_id}"
+                    # Full namespace path (e.g. "group/subgroup/repo") needed for correct GitLab web URLs
+                    p_path = (project_info.get('path_with_namespace') or p_name) if isinstance(project_info, dict) and not project_info.get('error') else p_name
                     active_tasks[task_id]['logs'].append({
                         'level': 'INFO',
-                        'message': '📸 Rollback snapshot saved',
+                        'message': f'Starting commit for {p_name}...',
                         'timestamp': datetime.now().isoformat()
                     })
-                except Exception as rb_err:
-                    print(f"[WARN] Could not save rollback snapshot: {rb_err}")
                 
-                # Commit changes
-                active_tasks[task_id]['logs'].append({
-                    'level': 'INFO',
-                    'message': f'Committing {len(actions)} file(s) to {ms.FEATURE_BRANCH}...',
-                    'timestamp': datetime.now().isoformat()
-                })
+                    # Check if branch exists, create if needed
+                    br_check = ms.api_call(f"projects/{project_id}/repository/branches/{urllib.parse.quote(ms.FEATURE_BRANCH, safe='')}")
                 
-                commit_payload = {
-                    "branch": ms.FEATURE_BRANCH,
-                    "commit_message": f"fix: java17-migration",
-                    "actions": actions
-                }
-                
-                commit_resp = ms.api_call(f"projects/{project_id}/repository/commits", "POST", commit_payload)
-                
-                if isinstance(commit_resp, dict) and not commit_resp.get("error"):
-                    commit_sha = commit_resp.get('id', 'unknown')
-                    committer_name = commit_resp.get('committer_name') or commit_resp.get('author_name', 'Unknown')
-                    commit_message = commit_resp.get('title') or commit_resp.get('message', 'fix: java17-migration')
-                    
-                    active_tasks[task_id]['commit_sha'] = commit_sha
-                    active_tasks[task_id]['file_count'] = len(actions)
-                    active_tasks[task_id]['logs'].append({
-                        'level': 'SUCCESS',
-                        'message': f'✅ Commit successful! SHA: {commit_sha[:8]}',
-                        'timestamp': datetime.now().isoformat()
-                    })
-                    active_tasks[task_id]['status'] = 'success'
-                    
-                    # Update pipeline status with committer info
-                    update_pipeline_status(project_id, 'running', commit_sha=commit_sha,
-                                           committer_name=committer_name, commit_message=commit_message,
-                                           workflow_stage='committed')
-                    
-                    # Wait for pipeline to be created
-                    active_tasks[task_id]['logs'].append({
-                        'level': 'INFO',
-                        'message': 'Waiting for pipeline to be created...',
-                        'timestamp': datetime.now().isoformat()
-                    })
-                    time.sleep(10)
-                    
-                    # Get pipeline ID (retry up to 3 times in case pipeline is slow to appear)
-                    pipeline = None
-                    for retry in range(3):
-                        pipeline = ms.get_pipeline_for_commit(project_id, commit_sha)
-                        if pipeline:
-                            break
-                        if retry < 2:
-                            time.sleep(15)
-                    
-                    if pipeline:
-                        pipeline_id = pipeline.get('id')
-                        active_tasks[task_id]['pipeline_id'] = pipeline_id
-                        update_pipeline_status(project_id, 'running', pipeline_id=pipeline_id,
-                                               commit_sha=commit_sha, committer_name=committer_name,
-                                               commit_message=commit_message)
-                        
+                    if not (isinstance(br_check, dict) and "name" in br_check):
                         active_tasks[task_id]['logs'].append({
                             'level': 'INFO',
-                            'message': f'Pipeline #{pipeline_id} created - monitoring status...',
+                            'message': f'Creating branch {ms.FEATURE_BRANCH}...',
                             'timestamp': datetime.now().isoformat()
                         })
-                        
-                        # Capture variables for closure
-                        _pid = project_id
-                        _pipeline_id = pipeline_id
-                        _commit_sha = commit_sha
-                        _committer_name = committer_name
-                        _commit_message = commit_message
-                        _task_id = task_id
-                        
-                        # Monitor pipeline in background (non-daemon so it survives page reload)
-                        def monitor_pipeline():
-                            result = ms.wait_for_pipeline_completion(_pid, _pipeline_id, timeout=1800, check_interval=30)
-                            final_status = result.get('status', 'unknown')
-                            
-                            if final_status == 'success':
-                                if _task_id in active_tasks:
-                                    active_tasks[_task_id]['logs'].append({
-                                        'level': 'SUCCESS',
-                                        'message': f'✅ Pipeline #{_pipeline_id} completed successfully!',
-                                        'timestamp': datetime.now().isoformat()
-                                    })
-                                update_pipeline_status(_pid, 'success', pipeline_id=_pipeline_id,
-                                                       commit_sha=_commit_sha, committer_name=_committer_name,
-                                                       commit_message=_commit_message, workflow_stage='pipeline_success')
-                            else:
-                                if _task_id in active_tasks:
-                                    active_tasks[_task_id]['logs'].append({
-                                        'level': 'ERROR',
-                                        'message': f'❌ Pipeline #{_pipeline_id} status: {final_status}',
-                                        'timestamp': datetime.now().isoformat()
-                                    })
-                                update_pipeline_status(_pid, 'failed', pipeline_id=_pipeline_id,
-                                                       commit_sha=_commit_sha, committer_name=_committer_name,
-                                                       commit_message=_commit_message, workflow_stage='committed')
-                        
-                        threading.Thread(target=monitor_pipeline, daemon=True).start()
-                    else:
+                        ms.create_feature_branch(project_id, p_name)
+                
+                    # Prepare commit actions
+                    actions = []
+                    current_ref = ms.FEATURE_BRANCH if isinstance(br_check, dict) and "name" in br_check else ms.SOURCE_BRANCH
+                    files_to_backup = []
+                
+                    if '1' in choices:  # POM
+                        res = ms.api_call(f"projects/{project_id}/repository/files/{urllib.parse.quote('pom.xml', safe='')}?ref={urllib.parse.quote(current_ref, safe='')}")
+                        if isinstance(res, dict) and "content" in res:
+                            orig = base64.b64decode(res['content']).decode('utf-8')
+                            upd = re.sub(r"<(java\.version|maven\.compiler\.(source|target|release))>11</\1>", r"<\1>17</\1>", orig)
+                            if "<parent>" in upd:
+                                upd = re.sub(r"<parent>[\s\S]*?</parent>", ms.update_parent_block, upd)
+                            if orig != upd:
+                                actions.append({"action": "update", "file_path": "pom.xml", "content": upd})
+                                files_to_backup.append('pom.xml')
+                
+                    if '2' in choices:  # CI
+                        res = ms.api_call(f"projects/{project_id}/repository/files/{urllib.parse.quote('.gitlab-ci.yml', safe='')}?ref={urllib.parse.quote(current_ref, safe='')}")
+                        if isinstance(res, dict) and "content" in res:
+                            orig = base64.b64decode(res['content']).decode('utf-8')
+                            upd = re.sub(r"^\s*image:.*(\n|$)", "", orig, flags=re.MULTILINE)
+                            if orig != upd:
+                                actions.append({"action": "update", "file_path": ".gitlab-ci.yml", "content": upd})
+                                files_to_backup.append('.gitlab-ci.yml')
+                
+                    if '3' in choices:  # EB Config
+                        path = urllib.parse.quote(".elasticbeanstalk/config.yml", safe='')
+                        res = ms.api_call(f"projects/{project_id}/repository/files/{path}?ref={urllib.parse.quote(current_ref, safe='')}")
+                        if isinstance(res, dict) and "content" in res:
+                            orig = base64.b64decode(res['content']).decode('utf-8')
+                            upd = re.sub(r"(default_platform:\s*).*$", f"default_platform: {ms.NEW_DEFAULT_PLATFORM}", orig, flags=re.MULTILINE)
+                            if orig != upd:
+                                actions.append({"action": "update", "file_path": ".elasticbeanstalk/config.yml", "content": upd})
+                                files_to_backup.append('.elasticbeanstalk/config.yml')
+                
+                    if not actions:
                         active_tasks[task_id]['logs'].append({
-                            'level': 'WARN',
-                            'message': 'Pipeline not found yet - check GitLab manually',
+                            'level': 'INFO',
+                            'message': 'No changes detected - files may already be updated',
                             'timestamp': datetime.now().isoformat()
                         })
-                    
-                    add_project_to_history(project_id, p_name, 'commit', 'success', {
-                        'commit_sha': commit_sha,
-                        'file_count': len(actions)
-                    })
-                    
-                    # ── Per-run log files ────────────────────────────────────
-                    # 1. Migration log
-                    save_run_migration_log(project_id, p_name, active_tasks[task_id]['logs'])
-                    # 2. Rollback log (already saved above via ms.save_rollback_data,
-                    #    but also save a timestamped copy here for per-run tracking)
+                        active_tasks[task_id]['status'] = 'no_changes'
+                        update_pipeline_status(project_id, 'no_changes')
+                        add_project_to_history(project_id, p_name, 'commit', 'no_changes')
+                        return
+                
+                    # Check if files already match
+                    all_match, details = ms.check_files_already_match(project_id, actions, ms.FEATURE_BRANCH)
+                
+                    if all_match:
+                        active_tasks[task_id]['logs'].append({
+                            'level': 'INFO',
+                            'message': 'All files already match desired state - skipping commit',
+                            'timestamp': datetime.now().isoformat()
+                        })
+                        active_tasks[task_id]['status'] = 'idempotent'
+                        update_pipeline_status(project_id, 'success')
+                        add_project_to_history(project_id, p_name, 'commit', 'idempotent')
+                        return
+                
+                    # Save rollback snapshot before committing
                     try:
                         snapshot = ms.create_rollback_snapshot(project_id, p_name, current_ref, files_to_backup)
-                        rb_data = {
-                            'created_at': datetime.now().isoformat(),
-                            'commit_sha': commit_sha,
+                        rollback_data = {
                             'project_id': project_id,
                             'project_name': p_name,
                             'branch': current_ref,
                             'snapshots': [snapshot]
                         }
-                        save_run_rollback_log(project_id, p_name, rb_data)
+                        ms.save_rollback_data(rollback_data)
+                        active_tasks[task_id]['logs'].append({
+                            'level': 'INFO',
+                            'message': '📸 Rollback snapshot saved',
+                            'timestamp': datetime.now().isoformat()
+                        })
                     except Exception as rb_err:
-                        print(f"[WARN] Could not save per-run rollback copy: {rb_err}")
-                    # 3. State log
-                    save_run_state_log(project_id, p_name, {
-                        'operation': 'commit',
-                        'status': 'success',
-                        'commit_sha': commit_sha,
-                        'files_changed': [a['file_path'] for a in actions],
-                        'pipeline_id': active_tasks[task_id].get('pipeline_id'),
-                        'workflow_stage': 'committed'
+                        print(f"[WARN] Could not save rollback snapshot: {rb_err}")
+                
+                    # Commit changes
+                    active_tasks[task_id]['logs'].append({
+                        'level': 'INFO',
+                        'message': f'Committing {len(actions)} file(s) to {ms.FEATURE_BRANCH}...',
+                        'timestamp': datetime.now().isoformat()
                     })
-                    # ────────────────────────────────────────────────────────
-                else:
-                    error_msg = commit_resp.get('details', 'Unknown error')
+                
+                    commit_payload = {
+                        "branch": ms.FEATURE_BRANCH,
+                        "commit_message": _message,
+                        "actions": actions
+                    }
+                
+                    commit_resp = ms.api_call(f"projects/{project_id}/repository/commits", "POST", commit_payload)
+                
+                    if isinstance(commit_resp, dict) and not commit_resp.get("error"):
+                        commit_sha = commit_resp.get('id', 'unknown')
+                        committer_name = commit_resp.get('committer_name') or commit_resp.get('author_name', 'Unknown')
+                        commit_message = commit_resp.get('title') or commit_resp.get('message', 'fix: java17-migration')
+                    
+                        active_tasks[task_id]['commit_sha'] = commit_sha
+                        active_tasks[task_id]['file_count'] = len(actions)
+                        active_tasks[task_id]['logs'].append({
+                            'level': 'SUCCESS',
+                            'message': f'✅ Commit successful! SHA: {commit_sha[:8]}',
+                            'timestamp': datetime.now().isoformat()
+                        })
+                        active_tasks[task_id]['status'] = 'success'
+                    
+                        # ── SHA-STRICT: Lock status as 'syncing' immediately post-commit ──────
+                        # 'syncing' tells the UI "a commit exists but we haven't yet found
+                        # the pipeline that matches this exact SHA". The branch-cut pipeline
+                        # GitLab fires first will have a different SHA — while status is
+                        # 'syncing' the frontend shows a neutral blue pill and suppresses
+                        # any 'failed' signal from that wrong pipeline.
+                        update_pipeline_status(project_id, 'syncing', commit_sha=commit_sha,
+                                               committer_name=committer_name, commit_message=commit_message,
+                                               workflow_stage='committed', path_with_namespace=p_path)
+                    
+                        # Wait for pipeline to be created then poll until it appears.
+                        # GitLab creates the pipeline asynchronously — on a busy instance or when a
+                        # runner must pull a Docker image first, the pipeline object can take several
+                        # minutes to appear via the API. We allow up to 5 minutes of retries.
+                        active_tasks[task_id]['logs'].append({
+                            'level': 'INFO',
+                            'message': '🔍 Commit SHA locked. Scanning for migration pipeline (ignoring branch-cut pipeline)...',
+                            'timestamp': datetime.now().isoformat()
+                        })
+                        time.sleep(10)  # Settlement pause — lets GitLab branch-cut side-effect pipeline finish before we poll for the migration-commit SHA
+                    
+                        # Get pipeline ID — retry for up to ~5 minutes (15 retries × 20 s)
+                        pipeline = None
+                        for retry in range(15):
+                            pipeline = ms.get_pipeline_for_commit(project_id, commit_sha)
+                            if pipeline:
+                                break
+                            elapsed_s = (retry + 1) * 20
+                            active_tasks[task_id]['logs'].append({
+                                'level': 'INFO',
+                                'message': f'Pipeline not visible yet — retrying... ({elapsed_s}s elapsed)',
+                                'timestamp': datetime.now().isoformat()
+                            })
+                            if retry < 14:
+                                time.sleep(20)
+                    
+                        if pipeline:
+                            pipeline_id = pipeline.get('id')
+                            # ── SHA-STRICT gate: only advance to 'running' if SHAs match ──────────
+                            pipeline_sha = pipeline.get('sha', '')
+                            # STRICT: if SHA is absent (empty) OR doesn't match our commit SHA,
+                            # this is not our pipeline (likely the branch-cut pipeline1).
+                            # Fall through to late-discovery so pipeline2 is found instead.
+                            if not pipeline_sha or pipeline_sha != commit_sha:
+                                sha_got = pipeline_sha[:8] if pipeline_sha else '(none)'
+                                active_tasks[task_id]['logs'].append({
+                                    'level': 'WARN',
+                                    'message': (f'⚠️ Pipeline #{pipeline_id} SHA mismatch '
+                                                f'(got {sha_got}, expected {commit_sha[:8]}) '
+                                                f'— this is the branch-cut pipeline. Skipping...'),
+                                    'timestamp': datetime.now().isoformat()
+                                })
+                                # Keep status='syncing'; fall through to late-discovery
+                                pipeline = None
+                            else:
+                                active_tasks[task_id]['pipeline_id'] = pipeline_id
+                                update_pipeline_status(project_id, 'running', pipeline_id=pipeline_id,
+                                                       commit_sha=commit_sha, committer_name=committer_name,
+                                                       commit_message=commit_message, path_with_namespace=p_path)
+                                active_tasks[task_id]['logs'].append({
+                                    'level': 'INFO',
+                                    'message': f'✅ SHA verified! Pipeline #{pipeline_id} matched commit {commit_sha[:8]} — monitoring...',
+                                    'timestamp': datetime.now().isoformat()
+                                })
+                    
+                        if pipeline:  # re-check after SHA gate above
+                        
+                            # Capture variables for closure
+                            _pid = project_id
+                            _pipeline_id = pipeline_id
+                            _commit_sha = commit_sha
+                            _committer_name = committer_name
+                            _commit_message = commit_message
+                            _task_id = task_id
+                        
+                            # Monitor pipeline in background (non-daemon so it survives page reload)
+                            def monitor_pipeline():
+                                # ── SHA Guard ──────────────────────────────────────────────────────
+                                # Verify the pipeline we found actually belongs to the migration commit
+                                # before investing 2 hours of monitoring on it.
+                                try:
+                                    _verify_pl = ms.api_call(f"projects/{_pid}/pipelines/{_pipeline_id}")
+                                    if isinstance(_verify_pl, dict) and not _verify_pl.get('error'):
+                                        pl_sha = _verify_pl.get('sha', '')
+                                        if not pl_sha or pl_sha != _commit_sha:
+                                            sha_got = pl_sha[:8] if pl_sha else '(none)'
+                                            print(f"[PIPELINE] SHA mismatch on pipeline {_pipeline_id}: "
+                                                  f"expected {_commit_sha[:8]}, got {sha_got} — skipping monitor")
+                                            if _task_id in active_tasks:
+                                                active_tasks[_task_id]['logs'].append({
+                                                    'level': 'WARN',
+                                                    'message': f'⚠️ Pipeline #{_pipeline_id} belongs to a different commit — waiting for migration pipeline...',
+                                                    'timestamp': datetime.now().isoformat()
+                                                })
+                                            # Fall through to late-discovery rather than monitoring the wrong pipeline
+                                            return
+                                except Exception as _sha_err:
+                                    print(f"[PIPELINE] SHA verification error: {_sha_err}")
+                                # ───────────────────────────────────────────────────────────────────
+                                # Allow up to 2 hours total.  Maven builds that cold-pull a Docker
+                                # image can legitimately take 45-90 minutes; the previous 30-minute
+                                # inner cap was firing prematurely and marking the pipeline 'failed'.
+                                MONITOR_TIMEOUT = 7200  # 2-hour safety timeout
+                                deadline = time.time() + MONITOR_TIMEOUT
+                                try:
+                                    # Use the FULL remaining window — do NOT artificially cap at 1800 s.
+                                    # wait_for_pipeline_completion will poll every 30 s until the
+                                    # pipeline reaches a terminal state or the deadline expires.
+                                    remaining = max(60, int(deadline - time.time()))
+                                    result = ms.wait_for_pipeline_completion(
+                                        _pid, _pipeline_id,
+                                        timeout=remaining,
+                                        check_interval=30
+                                    )
+                                except Exception as e:
+                                    print(f"[PIPELINE] monitor_pipeline exception for {_pid}/{_pipeline_id}: {e}")
+                                    result = {'status': 'timeout'}
+
+                                if time.time() >= deadline:
+                                    print(f"[PIPELINE] Safety timeout hit for pipeline {_pipeline_id} on project {_pid}")
+                                    result = {'status': 'timeout'}
+
+                                final_status = result.get('status', 'unknown')
+                            
+                                if final_status == 'success':
+                                    if _task_id in active_tasks:
+                                        active_tasks[_task_id]['logs'].append({
+                                            'level': 'SUCCESS',
+                                            'message': f'✅ Pipeline #{_pipeline_id} completed successfully!',
+                                            'timestamp': datetime.now().isoformat()
+                                        })
+                                    update_pipeline_status(_pid, 'success', pipeline_id=_pipeline_id,
+                                                           commit_sha=_commit_sha, committer_name=_committer_name,
+                                                           commit_message=_commit_message, workflow_stage='pipeline_success')
+                                elif final_status == 'timeout':
+                                    if _task_id in active_tasks:
+                                        active_tasks[_task_id]['logs'].append({
+                                            'level': 'WARN',
+                                            'message': f'⏰ Pipeline #{_pipeline_id} monitoring timed out after 60 min — check GitLab directly',
+                                            'timestamp': datetime.now().isoformat()
+                                        })
+                                    # Mark as failed in cache to unblock UI
+                                    update_pipeline_status(_pid, 'failed', pipeline_id=_pipeline_id,
+                                                           commit_sha=_commit_sha, committer_name=_committer_name,
+                                                           commit_message=_commit_message, workflow_stage='committed')
+                                else:
+                                    if _task_id in active_tasks:
+                                        active_tasks[_task_id]['logs'].append({
+                                            'level': 'ERROR',
+                                            'message': f'❌ Pipeline #{_pipeline_id} status: {final_status}',
+                                            'timestamp': datetime.now().isoformat()
+                                        })
+                                    update_pipeline_status(_pid, 'failed', pipeline_id=_pipeline_id,
+                                                           commit_sha=_commit_sha, committer_name=_committer_name,
+                                                           commit_message=_commit_message, workflow_stage='committed')
+                        
+                            threading.Thread(target=monitor_pipeline, daemon=True).start()
+                        else:
+                            active_tasks[task_id]['logs'].append({
+                                'level': 'WARN',
+                                'message': '⚠️ Pipeline not found after 5 min — starting background discovery. '
+                                           'The pipeline may still appear once GitLab\'s runner picks up the job.',
+                                'timestamp': datetime.now().isoformat()
+                            })
+                            # Capture for the late-discovery closure
+                            _late_pid = project_id
+                            _late_sha = commit_sha
+                            _late_task_id = task_id
+                            _late_committer = committer_name
+                            _late_message = commit_message
+                            _late_path = p_path
+
+                            def late_pipeline_discovery():
+                                """Keep looking for the pipeline for up to 30 extra minutes."""
+                                found_pipeline = None
+                                for attempt in range(30):   # 30 × 60 s = 30 min
+                                    time.sleep(60)
+                                    candidate = ms.get_pipeline_for_commit(_late_pid, _late_sha)
+                                    if candidate:
+                                        # Strict SHA guard: discard pipelines that don't match our commit
+                                        if candidate.get('sha', '') == _late_sha:
+                                            found_pipeline = candidate
+                                            break
+                                        else:
+                                            print(f"[PIPELINE] Late-discovery: candidate pipeline {candidate.get('id')} "
+                                                  f"SHA {candidate.get('sha','?')[:8]} != expected {_late_sha[:8]} — skipping")
+                                    print(f"[PIPELINE] Late-discovery attempt {attempt+1}/30 for {_late_pid} SHA {_late_sha[:8]}")
+
+                                if not found_pipeline:
+                                    print(f"[PIPELINE] Late-discovery gave up for project {_late_pid}")
+                                    if _late_task_id in active_tasks:
+                                        active_tasks[_late_task_id]['logs'].append({
+                                            'level': 'ERROR',
+                                            'message': '❌ Could not locate pipeline after 35 min — please check GitLab directly.',
+                                            'timestamp': datetime.now().isoformat()
+                                        })
+                                    return
+
+                                late_pid_id = found_pipeline.get('id')
+                                print(f"[PIPELINE] Late-discovery found pipeline #{late_pid_id} for project {_late_pid}")
+                                if _late_task_id in active_tasks:
+                                    active_tasks[_late_task_id]['pipeline_id'] = late_pid_id
+                                    active_tasks[_late_task_id]['logs'].append({
+                                        'level': 'INFO',
+                                        'message': f'🔍 Pipeline #{late_pid_id} found — now monitoring...',
+                                        'timestamp': datetime.now().isoformat()
+                                    })
+                                update_pipeline_status(_late_pid, 'running', pipeline_id=late_pid_id,
+                                                       commit_sha=_late_sha, committer_name=_late_committer,
+                                                       commit_message=_late_message, path_with_namespace=_late_path)
+
+                                # Monitor through to completion (up to 2 hours)
+                                try:
+                                    result = ms.wait_for_pipeline_completion(_late_pid, late_pid_id,
+                                                                              timeout=7200, check_interval=30)
+                                except Exception as exc:
+                                    result = {'status': 'timeout'}
+
+                                final = result.get('status', 'unknown')
+                                if final == 'success':
+                                    update_pipeline_status(_late_pid, 'success', pipeline_id=late_pid_id,
+                                                           commit_sha=_late_sha, workflow_stage='pipeline_success',
+                                                           path_with_namespace=_late_path)
+                                    if _late_task_id in active_tasks:
+                                        active_tasks[_late_task_id]['logs'].append({
+                                            'level': 'SUCCESS',
+                                            'message': f'✅ Pipeline #{late_pid_id} completed successfully!',
+                                            'timestamp': datetime.now().isoformat()
+                                        })
+                                else:
+                                    update_pipeline_status(_late_pid, 'failed', pipeline_id=late_pid_id,
+                                                           commit_sha=_late_sha, workflow_stage='committed',
+                                                           path_with_namespace=_late_path)
+                                    if _late_task_id in active_tasks:
+                                        active_tasks[_late_task_id]['logs'].append({
+                                            'level': 'ERROR',
+                                            'message': f'❌ Pipeline #{late_pid_id} ended with status: {final}',
+                                            'timestamp': datetime.now().isoformat()
+                                        })
+
+                            threading.Thread(target=late_pipeline_discovery, daemon=True).start()
+                    
+                        add_project_to_history(project_id, p_name, 'commit', 'success', {
+                            'commit_sha': commit_sha,
+                            'file_count': len(actions)
+                        })
+                    
+                        # ── Per-run log files ────────────────────────────────────
+                        # 1. Migration log
+                        save_run_migration_log(project_id, p_name, active_tasks[task_id]['logs'])
+                        # 2. Rollback log (already saved above via ms.save_rollback_data,
+                        #    but also save a timestamped copy here for per-run tracking)
+                        try:
+                            snapshot = ms.create_rollback_snapshot(project_id, p_name, current_ref, files_to_backup)
+                            rb_data = {
+                                'created_at': datetime.now().isoformat(),
+                                'commit_sha': commit_sha,
+                                'project_id': project_id,
+                                'project_name': p_name,
+                                'branch': current_ref,
+                                'snapshots': [snapshot]
+                            }
+                            save_run_rollback_log(project_id, p_name, rb_data)
+                        except Exception as rb_err:
+                            print(f"[WARN] Could not save per-run rollback copy: {rb_err}")
+                        # 3. State log
+                        save_run_state_log(project_id, p_name, {
+                            'operation': 'commit',
+                            'status': 'success',
+                            'commit_sha': commit_sha,
+                            'files_changed': [a['file_path'] for a in actions],
+                            'pipeline_id': active_tasks[task_id].get('pipeline_id'),
+                            'workflow_stage': 'committed'
+                        })
+                        # ────────────────────────────────────────────────────────
+                        _commit_succeeded = True
+                    else:
+                        error_msg = commit_resp.get('details', 'Unknown error')
+                        active_tasks[task_id]['logs'].append({
+                            'level': 'ERROR',
+                            'message': f'Commit failed: {error_msg}',
+                            'timestamp': datetime.now().isoformat()
+                        })
+                        active_tasks[task_id]['status'] = 'failed'
+                        update_pipeline_status(project_id, 'commit_failed')
+                        add_project_to_history(project_id, p_name, 'commit', 'failed', {'error': error_msg})
+                    
+                except Exception as e:
+                    print(f"[ERROR] Commit thread error: {e}")
                     active_tasks[task_id]['logs'].append({
                         'level': 'ERROR',
-                        'message': f'Commit failed: {error_msg}',
+                        'message': f'Exception: {str(e)}',
                         'timestamp': datetime.now().isoformat()
                     })
                     active_tasks[task_id]['status'] = 'failed'
                     update_pipeline_status(project_id, 'commit_failed')
-                    add_project_to_history(project_id, p_name, 'commit', 'failed', {'error': error_msg})
-                    
-            except Exception as e:
-                print(f"[ERROR] Commit thread error: {e}")
-                active_tasks[task_id]['logs'].append({
-                    'level': 'ERROR',
-                    'message': f'Exception: {str(e)}',
-                    'timestamp': datetime.now().isoformat()
-                })
-                active_tasks[task_id]['status'] = 'failed'
-                update_pipeline_status(project_id, 'commit_failed')
+            finally:
+                if _acquired:
+                    _queue_release(pid_str, succeeded=_commit_succeeded)
         
         threading.Thread(target=commit_thread, daemon=True).start()
         
@@ -625,11 +1194,11 @@ def create_mr(project_id):
     """Create merge request for a project"""
     try:
         data = request.json
-        branch_num = data.get('branch_num', '1293')
+        branch_num = data.get('branch_num', '12938')
         
         # Set branch configuration
         ms.JIRA_ID = branch_num
-        ms.FEATURE_BRANCH = f"task-{branch_num}-java17-migration"
+        ms.FEATURE_BRANCH = _build_feature_branch(branch_num, data.get("branch_prefix","task-"), data.get("branch_suffix","java17-migration"))
         ms.MR_TITLE = f"TASK-{branch_num}: java migration"
         
         task_id = f"{project_id}_mr_{int(time.time() * 1000)}"
@@ -689,12 +1258,75 @@ def create_mr(project_id):
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/api/projects/<int:project_id>/check-develop', methods=['GET'])
+def check_develop(project_id):
+    """Check whether develop/master/main branch already has Java 17 in pom.xml.
+    Returns: { status: 'done' | 'needs_migration' | 'unknown', detail: str, branch: str }
+    """
+    try:
+        # Resolve source branch: develop → master → main
+        source_branch = _resolve_source_branch(project_id)
+
+        pom_res = ms.api_call(
+            f"projects/{project_id}/repository/files/{urllib.parse.quote('pom.xml', safe='')}?ref={urllib.parse.quote(source_branch, safe='')}"
+        )
+        if not isinstance(pom_res, dict) or 'content' in pom_res is False:
+            return jsonify({'status': 'unknown', 'detail': f'pom.xml not found on {source_branch}', 'branch': source_branch})
+
+        if pom_res.get('error'):
+            return jsonify({'status': 'unknown', 'detail': pom_res.get('details', 'API error'), 'branch': source_branch})
+
+        pom_content = base64.b64decode(pom_res['content']).decode('utf-8', errors='replace')
+
+        # Use individual tag patterns to avoid backreference issues with nested alternation groups
+        _JAVA_TAGS = [
+            r'java\.version',
+            r'maven\.compiler\.source',
+            r'maven\.compiler\.target',
+            r'maven\.compiler\.release',
+        ]
+
+        def _find_java_ver(text, exact=None):
+            for tag in _JAVA_TAGS:
+                if exact is not None:
+                    m = re.search(rf'<{tag}>\s*{re.escape(str(exact))}\s*</{tag}>', text)
+                else:
+                    m = re.search(rf'<{tag}>\s*(\d+)\s*</{tag}>', text)
+                if m:
+                    return m
+            return None
+
+        if _find_java_ver(pom_content, exact=17):
+            return jsonify({'status': 'done', 'detail': f'Java 17 already present in {source_branch} pom.xml', 'branch': source_branch})
+
+        m = _find_java_ver(pom_content)
+        if m:
+            found_ver = m.group(1)
+            return jsonify({
+                'status': 'needs_migration',
+                'detail': f'Found Java {found_ver} on {source_branch} — migration needed',
+                'branch': source_branch
+            })
+
+        # Loose fallback: tag exists but version unparseable
+        loose_pat = r'<(?:java\.version|maven\.compiler\.(?:source|target|release))>'
+        if re.search(loose_pat, pom_content, re.IGNORECASE):
+            return jsonify({'status': 'needs_migration', 'detail': f'Java version property found on {source_branch} (version unclear — check manually)', 'branch': source_branch})
+
+        return jsonify({'status': 'unknown', 'detail': f'No Java version property found in {source_branch} pom.xml (checked java.version and maven.compiler.source/target/release)', 'branch': source_branch})
+
+    except Exception as e:
+        return jsonify({'status': 'unknown', 'detail': str(e)}), 500
+
+
 @app.route('/api/projects/<int:project_id>/branch-status', methods=['GET'])
 def get_branch_status(project_id):
     """Check whether the feature branch still exists, and if MR is merged"""
     try:
-        branch_num = request.args.get('branch_num', '1293')
-        feature_branch = f"task-{branch_num}-java17-migration"
+        branch_num    = request.args.get('branch_num', '12938')
+        branch_prefix = request.args.get('branch_prefix', 'task-')
+        branch_suffix = request.args.get('branch_suffix', 'java17-migration')
+        feature_branch = _build_feature_branch(branch_num, branch_prefix, branch_suffix)
         
         # Check if branch exists
         branch_resp = ms.api_call(f"projects/{project_id}/repository/branches/{urllib.parse.quote(feature_branch, safe='')}")
@@ -767,6 +1399,131 @@ def remove_project_status(project_id):
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+# ── Queue / Circuit-Breaker endpoints ─────────────────────────────────────────
+
+@app.route('/api/queue-status', methods=['GET'])
+def get_queue_status():
+    """Return current queue state for all tracked projects."""
+    with _queue_lock:
+        snapshot = {
+            pid: {
+                'position': info['position'],
+                'status': info['status'],
+            }
+            for pid, info in _queue_state.items()
+        }
+    running = sum(1 for v in snapshot.values() if v['status'] == 'running')
+    queued  = sum(1 for v in snapshot.values() if v['status'] == 'queued')
+    return jsonify({
+        'projects': snapshot,
+        'running': running,
+        'queued': queued,
+        'max_concurrent': MAX_CONCURRENT,
+        'circuit_breaker': {
+            'paused': _cb_state['paused'],
+            'consecutive_failures': _cb_state['consecutive_failures'],
+            'threshold': _cb_state['THRESHOLD'],
+        }
+    })
+
+
+@app.route('/api/queue/stop-all', methods=['POST'])
+def queue_stop_all():
+    """Cancel all QUEUED (not yet running) projects."""
+    cancelled = []
+    with _queue_lock:
+        for pid, info in _queue_state.items():
+            if info['status'] == 'queued':
+                info['cancel_event'].set()
+                cancelled.append(pid)
+    return jsonify({'success': True, 'cancelled': cancelled, 'count': len(cancelled)})
+
+
+@app.route('/api/circuit-breaker/resume', methods=['POST'])
+def circuit_breaker_resume():
+    """Manually resume a paused circuit breaker."""
+    _cb_state['paused'] = False
+    _cb_state['consecutive_failures'] = 0
+    _cb_state['resume_event'].set()
+    return jsonify({'success': True, 'message': 'Circuit breaker resumed'})
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@app.route('/api/projects/<int:project_id>/stop', methods=['POST'])
+def stop_project_migration(project_id):
+    """Send a stop signal to an active migration task for a project.
+    Sets a per-project interruption Event that background threads check,
+    and triggers save_state() via the migration script so progress is
+    persisted to a timestamped migration_state_*.json file.
+    """
+    try:
+        pid_str = str(project_id)
+
+        # Cancel if still queued (before it even acquires the semaphore)
+        with _queue_lock:
+            if pid_str in _queue_state and _queue_state[pid_str]['status'] == 'queued':
+                _queue_state[pid_str]['cancel_event'].set()
+
+        # Locate the most recent active task for this project
+        matching_task_id = None
+        for tid, task in active_tasks.items():
+            if task.get('project_id') == project_id and task.get('status') == 'running':
+                matching_task_id = tid
+                break
+
+        # Set (or create) the per-project stop Event
+        if pid_str not in project_interrupt_flags:
+            project_interrupt_flags[pid_str] = threading.Event()
+        project_interrupt_flags[pid_str].set()
+
+        # Also set the global INTERRUPTED flag in the migration script so that
+        # the existing INTERRUPTED checks inside pipeline/job wait loops fire.
+        ms.INTERRUPTED = True
+
+        # Build and persist a state snapshot so the operator can resume later.
+        current_status = pipeline_status.get(pid_str, {})
+        state_snapshot = {
+            'project_id': project_id,
+            'status': current_status.get('status', 'unknown'),
+            'workflow_stage': current_status.get('workflow_stage', 'idle'),
+            'commit_sha': current_status.get('commit_sha'),
+            'pipeline_id': current_status.get('pipeline_id'),
+            'stopped_by': 'user_request',
+        }
+        try:
+            ms.save_state(state_snapshot)
+        except Exception as save_err:
+            print(f"[WARN] Could not invoke ms.save_state: {save_err}")
+
+        # Mark the pipeline status as stopped so the UI reflects it immediately.
+        update_pipeline_status(
+            project_id,
+            'failed',
+            workflow_stage=current_status.get('workflow_stage', 'idle'),
+            pipeline_id=current_status.get('pipeline_id'),
+            commit_sha=current_status.get('commit_sha'),
+            committer_name=current_status.get('committer_name'),
+            commit_message=current_status.get('commit_message'),
+            path_with_namespace=current_status.get('path_with_namespace'),
+        )
+        save_pipeline_state()
+
+        if matching_task_id:
+            active_tasks[matching_task_id]['status'] = 'stopped'
+
+        print(f"[STOP] Stop signal sent for project {project_id}. State saved.")
+        return jsonify({
+            'success': True,
+            'message': f'Stop signal sent for project {project_id}. Migration state saved to file.',
+            'task_id': matching_task_id,
+        })
+    except Exception as e:
+        print(f"[ERROR] Stop endpoint error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+
 def save_run_state_log(project_id, p_name, run_info):
     """Save per-run state snapshot to state_logs/ folder"""
     try:
@@ -829,8 +1586,10 @@ def save_run_migration_log(project_id, p_name, log_lines):
 def get_commit_sha(project_id):
     """Get the latest commit SHA for a project's feature branch (for tag creation)"""
     try:
-        branch_num = request.args.get('branch_num', '1293')
-        feature_branch = f"task-{branch_num}-java17-migration"
+        branch_num    = request.args.get('branch_num', '12938')
+        branch_prefix = request.args.get('branch_prefix', 'task-')
+        branch_suffix = request.args.get('branch_suffix', 'java17-migration')
+        feature_branch = _build_feature_branch(branch_num, branch_prefix, branch_suffix)
         
         # First try the feature branch
         branch_info = ms.api_call(f"projects/{project_id}/repository/branches/{urllib.parse.quote(feature_branch, safe='')}")
@@ -928,16 +1687,71 @@ def delete_tag(project_id, tag_name):
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/api/projects/<int:project_id>/tags/<path:tag_name>/pipeline', methods=['GET'])
+def get_tag_pipeline_status(project_id, tag_name):
+    """Return the latest pipeline status for a given tag ref (used by the UI
+    to gate the Deploy button on the tag build pipeline succeeding)."""
+    try:
+        tag_name = urllib.parse.unquote(tag_name)
+        result = ms.api_call(
+            f"projects/{project_id}/pipelines?ref={urllib.parse.quote(tag_name, safe='')}&per_page=1"
+        )
+        if isinstance(result, list) and result:
+            p = result[0]
+            return jsonify({
+                'success': True,
+                'status': p.get('status'),        # pending / running / success / failed / canceled
+                'pipeline_id': p.get('id'),
+                'web_url': p.get('web_url', '')
+            })
+        return jsonify({'success': True, 'status': 'not_found'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+def extract_env_from_tag(tag_name):
+    """
+    Extract the bare environment name from a tag that may include a project-name prefix.
+
+    Examples
+    --------
+    'azure-dev'              -> 'azure-dev'
+    'azure-test'             -> 'azure-test'
+    'dev'                    -> 'dev'
+    'test'                   -> 'test'
+    'my-project-azure-dev'   -> 'azure-dev'
+    'my-service-dev'         -> 'dev'
+
+    The function checks the tag against a list of known environment suffixes and
+    strips any leading "project-name-" prefix.  Falls back to the full tag name if
+    no known suffix is matched, so nothing breaks for non-standard tags.
+    """
+    KNOWN_ENVS = [
+        'azure-dev', 'azure-test', 'azure-prod', 'azure-staging', 'azure-uat',
+        'dev', 'test', 'prod', 'staging', 'uat',
+    ]
+    tag_lower = tag_name.lower()
+    for env in KNOWN_ENVS:
+        if tag_lower == env:
+            return env
+        if tag_lower.endswith('-' + env):
+            return env
+    # Fallback — return as-is so nothing breaks
+    return tag_name
+
+
 @app.route('/api/projects/<int:project_id>/deploy', methods=['POST'])
 def deploy_project(project_id):
     """Deploy project with selected tags"""
     try:
         data = request.json
         tags = data.get('tags', [])
-        branch_num = data.get('branch_num', '1293')
+        source_branch = data.get('source_branch', None)  # None = use feature branch
+        post_merge_mode = data.get('post_merge_mode', False)
+        branch_num = data.get('branch_num', '12938')
         
         ms.JIRA_ID = branch_num
-        ms.FEATURE_BRANCH = f"task-{branch_num}-java17-migration"
+        ms.FEATURE_BRANCH = _build_feature_branch(branch_num, data.get("branch_prefix","task-"), data.get("branch_suffix","java17-migration"))
         
         if not tags:
             return jsonify({'success': False, 'error': 'No tags selected'}), 400
@@ -951,38 +1765,199 @@ def deploy_project(project_id):
         }
         
         def deploy_thread():
+            # ── Inline deployment logic ──────────────────────────────────────────
+            # handle_deployment() uses input() which raises EOFError in a background
+            # thread. We call the individual ms.* helpers directly instead so the
+            # tags chosen in the UI are used without any stdin interaction.
+            def _log(level, message):
+                active_tasks[task_id]['logs'].append({
+                    'level': level,
+                    'message': message,
+                    'timestamp': datetime.now().isoformat()
+                })
+
+            # ── Post-merge mode: verify the MR is actually merged before proceeding ──
+            if post_merge_mode:
+                try:
+                    feature_branch_enc = urllib.parse.quote(ms.FEATURE_BRANCH, safe='')
+                    mrs = ms.api_call(
+                        f"projects/{project_id}/merge_requests"
+                        f"?state=merged&source_branch={feature_branch_enc}&target_branch=develop&per_page=5"
+                    )
+                    if not isinstance(mrs, list) or len(mrs) == 0:
+                        _log('ERROR', (
+                            f'Post-merge deploy aborted: no merged MR found for '
+                            f'{ms.FEATURE_BRANCH} → develop. '
+                            f'Please ensure the MR is fully merged before deploying.'
+                        ))
+                        active_tasks[task_id]['status'] = 'failed'
+                        return
+                    _log('INFO', f'✅ MR verified as merged (MR !{mrs[0].get("iid","?")}). Proceeding with post-merge deploy.')
+                except Exception as mr_exc:
+                    _log('WARN', f'Could not verify MR merge status: {mr_exc}. Proceeding anyway.')
+
             try:
                 project_info = ms.api_call(f"projects/{project_id}")
                 p_name = project_info.get('name', f"ID:{project_id}") if isinstance(project_info, dict) else f"ID:{project_id}"
-                
-                active_tasks[task_id]['logs'].append({
-                    'level': 'INFO',
-                    'message': f'Starting deployment for {p_name}...',
-                    'timestamp': datetime.now().isoformat()
-                })
-                
-                # Simplified deployment process
-                result = ms.handle_deployment(project_id, p_name, state=None)
-                
-                if result['success']:
+                p_path = (project_info.get('path_with_namespace') or p_name) if isinstance(project_info, dict) and not project_info.get('error') else p_name
+                _project_web_url = f"{ms.BASE_URL.rstrip('/')}/{p_path}"
+                _log('INFO', f'Starting deployment for {p_name} — tags: {", ".join(tags)}')
+
+                # Resolve the branch to deploy from
+                deploy_branch = source_branch if source_branch else ms.FEATURE_BRANCH
+
+                # Get deploy branch HEAD commit
+                branch_info = ms.api_call(
+                    f"projects/{project_id}/repository/branches/{urllib.parse.quote(deploy_branch, safe='')}"
+                )
+                feature_head = None
+                if isinstance(branch_info, dict) and not branch_info.get('error'):
+                    feature_head = (branch_info.get('commit') or {}).get('id')
+
+                if not feature_head:
+                    _log('ERROR', f'Could not resolve HEAD of branch {deploy_branch}')
+                    active_tasks[task_id]['status'] = 'failed'
+                    return
+
+                deployment_successful = False
+
+                for tag_name in tags:
+                    _log('INFO', f'▶ Processing tag: {tag_name}')
+                    quoted_tag = urllib.parse.quote(tag_name, safe='')
+
+                    # Fetch current tag object (to check protected flag + current commit)
+                    all_tags_resp = ms.api_call(f"projects/{project_id}/repository/tags?per_page=100")
+                    tag_obj = None
+                    if isinstance(all_tags_resp, list):
+                        tag_obj = next((t for t in all_tags_resp if isinstance(t, dict) and t.get('name') == tag_name), None)
+
+                    if tag_obj and tag_obj.get('protected'):
+                        _log('ERROR', f'Tag "{tag_name}" is PROTECTED — skipping')
+                        continue
+
+                    tag_commit_id = (tag_obj.get('commit') or {}).get('id') if tag_obj else None
+                    created_commit = None
+
+                    if tag_commit_id and tag_commit_id == feature_head:
+                        _log('INFO', f'[IDEMPOTENT] "{tag_name}" already points to {feature_head[:8]} — skipping recreation')
+                        created_commit = tag_commit_id
+                    else:
+                        if tag_obj:
+                            _log('INFO', f'Deleting existing tag "{tag_name}" (was at {(tag_commit_id or "?")[:8]})...')
+                            ms.api_call(f"projects/{project_id}/repository/tags/{quoted_tag}", method='DELETE')
+                        _log('INFO', f'Creating tag "{tag_name}" on {deploy_branch} ({feature_head[:8]})...')
+                        t_res = ms.api_call(
+                            f"projects/{project_id}/repository/tags", 'POST',
+                            {'tag_name': tag_name, 'ref': deploy_branch}
+                        )
+                        if isinstance(t_res, dict) and not t_res.get('error'):
+                            created_commit = (t_res.get('commit') or {}).get('id')
+                            _log('INFO', f'Tag "{tag_name}" created at {(created_commit or "?")[:8]}')
+                        else:
+                            _log('ERROR', f'Failed to create tag "{tag_name}": {t_res.get("details") if isinstance(t_res, dict) else t_res}')
+                            continue
+
+                    if not created_commit:
+                        _log('WARN', f'No commit SHA for tag "{tag_name}" — skipping')
+                        continue
+
+                    _log('INFO', 'Waiting 10 s for GitLab to trigger the build pipeline...')
+                    time.sleep(10)
+
+                    pipeline = ms.get_pipeline_for_commit(project_id, created_commit)
+                    if not pipeline:
+                        _log('WARN', f'No pipeline found for commit {created_commit[:8]}')
+                        continue
+
+                    pipeline_id = pipeline.get('id')
+                    pipeline_url = f"{_project_web_url}/-/pipelines/{pipeline_id}"
+                    _log('INFO', f'Found pipeline #{pipeline_id} — waiting for completion (up to 30 min)...')
+                    _log('INFO', f'Pipeline URL: {pipeline_url}')
+
+                    p_result = ms.wait_for_pipeline_completion(project_id, pipeline_id, timeout=1800, check_interval=30)
+                    if p_result['status'] == 'interrupted':
+                        _log('WARN', 'Pipeline monitoring interrupted')
+                        break
+                    if p_result['status'] != 'success':
+                        _log('ERROR', f'Pipeline #{pipeline_id} ended with status: {p_result["status"]}')
+                        continue
+
+                    _log('INFO', f'Pipeline #{pipeline_id} succeeded!')
+                    jobs = ms.get_pipeline_jobs(project_id, pipeline_id)
+                    _log('INFO', f'Pipeline jobs: {[j.get("name") for j in jobs]}')
+
+                    # ── eb-terminate ──────────────────────────────────────────
+                    terminate_job = ms.find_job_by_name(jobs, 'eb-terminate')
+                    if terminate_job and terminate_job.get('status') == 'manual':
+                        # Strip any project-name prefix so the CI job receives just
+                        # the bare environment name, e.g. 'azure-dev' not 'my-project-azure-dev'.
+                        env_name = extract_env_from_tag(tag_name)
+                        _log('INFO', f"Triggering 'eb-terminate' job with ENVIRONMENT={env_name}...")
+                        _log('INFO', f"Job URL: {_project_web_url}/-/jobs/{terminate_job['id']}")
+                        # Trigger via GitLab /play API so we can pass the ENVIRONMENT variable.
+                        # This ensures the terminate job acts on the right EB environment
+                        # regardless of how the tag is named in GitLab.
+                        term_trigger = ms.api_call(
+                            f"projects/{project_id}/jobs/{terminate_job['id']}/play",
+                            'POST',
+                            {'variables': [{'key': 'ENVIRONMENT', 'value': env_name},
+                                           {'key': 'EB_ENV',      'value': env_name}]}
+                        )
+                        # Fallback: if the play endpoint failed (older GitLab), try trigger_manual_job
+                        if isinstance(term_trigger, dict) and term_trigger.get('error'):
+                            _log('WARN', f"play-with-variables failed ({term_trigger.get('details','')}), retrying without variables")
+                            ms.trigger_manual_job(project_id, terminate_job['id'])
+                        term_res = ms.wait_for_job_completion(project_id, terminate_job['id'], timeout=900)
+                        if term_res['status'] == 'interrupted':
+                            _log('WARN', 'eb-terminate interrupted')
+                            break
+                        if term_res['status'] != 'success':
+                            # Non-fatal: environment may not exist yet (first-time deploy)
+                            # or was already terminated. Log a warning and proceed with deploy.
+                            _log('WARN', f"eb-terminate ended with: {term_res['status']} — "
+                                         f"environment may not exist yet (first deploy). Proceeding with deploy...")
+                        else:
+                            _log('INFO', 'eb-terminate succeeded ✓')
+                    elif not terminate_job:
+                        _log('WARN', "'eb-terminate' job not found in pipeline — proceeding without terminate step")
+
+                    # ── eb-deploy ─────────────────────────────────────────────
+                    deploy_job_name = ms.map_tag_to_deploy_job(tag_name)
+                    if not deploy_job_name:
+                        _log('WARN', f'No deploy job mapped for tag "{tag_name}" — skipping')
+                        continue
+
+                    jobs = ms.get_pipeline_jobs(project_id, pipeline_id)  # re-fetch after terminate
+                    deploy_job = ms.find_job_by_name(jobs, deploy_job_name)
+                    if deploy_job and deploy_job.get('status') == 'manual':
+                        _log('INFO', f"Triggering '{deploy_job_name}' job...")
+                        _log('INFO', f"Job URL: {_project_web_url}/-/jobs/{deploy_job['id']}")
+                        ms.trigger_manual_job(project_id, deploy_job['id'])
+                        dep_res = ms.wait_for_job_completion(project_id, deploy_job['id'], timeout=1200)
+                        if dep_res['status'] == 'interrupted':
+                            _log('WARN', f"'{deploy_job_name}' interrupted")
+                            break
+                        if dep_res['status'] == 'success':
+                            _log('SUCCESS', f'[SUCCESS] Deployment completed for tag "{tag_name}"!')
+                            deployment_successful = True
+                        else:
+                            _log('ERROR', f"'{deploy_job_name}' ended with: {dep_res['status']}")
+                    elif not deploy_job:
+                        _log('WARN', f"Deploy job '{deploy_job_name}' not found in pipeline")
+                    else:
+                        _log('INFO', f"Deploy job '{deploy_job_name}' is in status '{deploy_job.get('status')}' — skipping trigger")
+
+                if deployment_successful:
                     active_tasks[task_id]['status'] = 'success'
-                    active_tasks[task_id]['logs'].append({
-                        'level': 'SUCCESS',
-                        'message': '✅ Deployment completed successfully',
-                        'timestamp': datetime.now().isoformat()
-                    })
-                    # Advance workflow stage to deployed
-                    update_pipeline_status(project_id, 'success', workflow_stage='deployed')
+                    _log('SUCCESS', '✅ Deployment completed successfully')
+                    final_stage = 'post_merge_deployed' if post_merge_mode else 'deployed'
+                    update_pipeline_status(project_id, 'success', workflow_stage=final_stage)
                     add_project_to_history(project_id, p_name, 'deploy', 'success', {'tags': tags})
                 else:
                     active_tasks[task_id]['status'] = 'failed'
-                    active_tasks[task_id]['logs'].append({
-                        'level': 'ERROR',
-                        'message': '❌ Deployment failed',
-                        'timestamp': datetime.now().isoformat()
-                    })
+                    _log('ERROR', '❌ Deployment did not complete — review logs above')
                     add_project_to_history(project_id, p_name, 'deploy', 'failed', {'tags': tags})
-                    
+
             except Exception as e:
                 print(f"[ERROR] Deploy thread error: {e}")
                 active_tasks[task_id]['logs'].append({
@@ -991,7 +1966,7 @@ def deploy_project(project_id):
                     'timestamp': datetime.now().isoformat()
                 })
                 active_tasks[task_id]['status'] = 'failed'
-        
+
         threading.Thread(target=deploy_thread, daemon=True).start()
         
         return jsonify({'success': True, 'task_id': task_id})
@@ -1006,14 +1981,14 @@ def bulk_create_mrs():
     try:
         data = request.json
         project_ids = data.get('project_ids', [])
-        branch_num  = data.get('branch_num', '1293')
+        branch_num  = data.get('branch_num', '12938')
         # Only use what the user actually selected in the UI.
         # An empty list means "no reviewers/assignees" — don't fall back to .env defaults.
         selected_assignees = data.get('assignees', [])   # list of usernames or []
         selected_reviewers = data.get('reviewers', [])   # list of usernames or []
 
         ms.JIRA_ID = branch_num
-        ms.FEATURE_BRANCH = f"task-{branch_num}-java17-migration"
+        ms.FEATURE_BRANCH = _build_feature_branch(branch_num, data.get("branch_prefix","task-"), data.get("branch_suffix","java17-migration"))
         ms.MR_TITLE = f"TASK-{branch_num}: java migration"
 
         # ── Server-side gate: pipeline must be at pipeline_success or beyond ──
@@ -1113,7 +2088,8 @@ def list_logs():
         log_dirs = {
             'migration_logs': '📝 Migration',
             'rollback_logs': '↩️ Rollback', 
-            'state_logs': '💾 State'
+            'state_logs': '💾 State',
+            'api_audit_logs': '🔍 Audit'
         }
         all_logs = []
         
@@ -1163,7 +2139,7 @@ def get_log_content(log_path):
         log_path = log_path.replace('\\', '/')
         
         # Security: ensure the path is within our log directories
-        allowed_dirs = ['migration_logs', 'rollback_logs', 'state_logs']
+        allowed_dirs = ['migration_logs', 'rollback_logs', 'state_logs', 'api_audit_logs']
         normalized_path = os.path.normpath(log_path)
         
         # Check if path starts with any allowed directory (handle both / and \ separators)
@@ -1380,6 +2356,489 @@ def perform_rollback_from_ui():
     except Exception as e:
         print(f"[ERROR] Rollback endpoint error: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+
+
+@app.route('/api/projects/<int:project_id>/branches/<path:branch_name>', methods=['DELETE'])
+def delete_branch(project_id, branch_name):
+    """Delete a feature branch"""
+    try:
+        branch_name = urllib.parse.unquote(branch_name)
+        result = ms.api_call(f"projects/{project_id}/repository/branches/{urllib.parse.quote(branch_name, safe='')}", "DELETE")
+        
+        if result is None or (isinstance(result, dict) and not result.get("error")):
+            print(f"[BRANCH] Deleted branch {branch_name} from project {project_id}")
+            return jsonify({'success': True})
+        else:
+            return jsonify({'success': False, 'error': str(result)}), 500
+    except Exception as e:
+        print(f"[ERROR] Branch delete error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/projects/<int:project_id>/pipelines/<int:pipeline_id>/retry', methods=['POST'])
+def retry_pipeline(project_id, pipeline_id):
+    """Retry a failed pipeline"""
+    try:
+        result = ms.api_call(f"projects/{project_id}/pipelines/{pipeline_id}/retry", "POST")
+        
+        if isinstance(result, dict) and not result.get("error"):
+            print(f"[PIPELINE] Retried pipeline {pipeline_id} for project {project_id}")
+            # Update pipeline status to running
+            update_pipeline_status(project_id, 'running', pipeline_id=pipeline_id)
+            return jsonify({'success': True, 'pipeline': result})
+        else:
+            return jsonify({'success': False, 'error': result.get('details', 'Unknown error')}), 500
+    except Exception as e:
+        print(f"[ERROR] Pipeline retry error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+
+@app.route('/api/reload-config', methods=['POST'])
+def reload_config():
+    """Re-read .env and reinitialise the HTTP session without restarting the server."""
+    global PROJECT_NAMES
+    try:
+        # Always use the BOM-safe robust reader so Windows Notepad edits don't break things
+        raw = _read_env_file_robust()
+        _apply_env_dict(raw)
+
+        # Also try migration_script reader as a cross-check
+        try:
+            new_env = ms.load_env_config()
+            if new_env.get('token') and not ms.TOKEN:
+                ms.TOKEN = new_env['token']
+            if new_env.get('projects'):
+                PROJECT_NAMES = new_env['projects']
+        except Exception:
+            pass
+
+        _ssl = raw.get('GITLAB_VERIFY_SSL', '').lower()
+        _ssl_bool = (_ssl != 'false') if _ssl else True
+        ms.SSL_VERIFY = _ssl_bool
+        ms.setup_http_session(ssl_verify=_ssl_bool)
+        print(f"[INFO] Config reloaded — {len(PROJECT_NAMES)} projects, token_set={bool(ms.TOKEN)}, base_url={ms.BASE_URL}")
+        return jsonify({'success': True, 'projects': len(PROJECT_NAMES), 'token_set': bool(ms.TOKEN), 'base_url': ms.BASE_URL})
+    except Exception as e:
+        print(f"[ERROR] reload-config error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/env-debug', methods=['GET'])
+def env_debug():
+    """Diagnostic: show exactly what is parsed from .env — open in browser to troubleshoot."""
+    env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+    result = {
+        'env_file_path': env_file,
+        'env_file_exists': os.path.exists(env_file),
+        'current_token_set': bool(ms.TOKEN),
+        'current_token_length': len(ms.TOKEN) if ms.TOKEN else 0,
+        'current_base_url': ms.BASE_URL,
+        'current_projects_count': len(PROJECT_NAMES),
+    }
+    if os.path.exists(env_file):
+        try:
+            raw_bytes = open(env_file, 'rb').read(4)
+            result['has_bom'] = raw_bytes[:3] == b'\xef\xbb\xbf'
+            result['first_bytes_hex'] = raw_bytes.hex()
+            with open(env_file, encoding='utf-8-sig', errors='replace') as f:
+                lines = f.read().splitlines()
+            result['total_lines'] = len(lines)
+            result['non_empty_non_comment_lines'] = len([l for l in lines if l.strip() and not l.strip().startswith('#')])
+            parsed = _read_env_file_robust()
+            # Show keys but mask token values
+            safe = {}
+            for k, v in parsed.items():
+                if 'TOKEN' in k or 'PASSWORD' in k or 'SECRET' in k:
+                    safe[k] = f'{"*" * min(len(v), 6)}... (length={len(v)})' if v else '(empty)'
+                else:
+                    safe[k] = v
+            result['parsed_keys'] = safe
+            result['token_key_found'] = any(k in parsed for k in ('GITLAB_TOKEN', 'TOKEN'))
+            result['base_url_key_found'] = any(k in parsed for k in ('BASE_URL', 'GITLAB_BASE_URL', 'GITLAB_URL'))
+        except Exception as ex:
+            result['read_error'] = str(ex)
+    return jsonify(result)
+
+
+@app.route('/api/config/reload', methods=['POST'])
+def config_reload():
+    global PROJECT_NAMES
+    try:
+        new_env = ms.load_env_config()
+        ms.BASE_URL = new_env['base_url']
+        ms.TOKEN = new_env['token']
+        ms.NEW_DEFAULT_PLATFORM = new_env['new_default_platform']
+        ms.REVIEWER_USERNAMES = new_env['reviewer_usernames']
+        ms.ASSIGNEE_USERNAMES = new_env['assignee_usernames']
+        PROJECT_NAMES = new_env['projects']
+        _ssl = new_env.get('ssl_verify')
+        if _ssl is None:
+            _ssl = True
+        ms.SSL_VERIFY = _ssl
+        ms.setup_http_session(ssl_verify=_ssl)
+
+        token_info = {'valid': False, 'reason': 'unknown'}
+        if not ms.TOKEN or ms.TOKEN.strip() == '':
+            token_info['reason'] = 'no_token'
+        elif not ms.BASE_URL or ms.BASE_URL.strip() == '':
+            token_info['reason'] = 'no_base_url'
+        elif ms.HTTP_SESSION is None:
+            token_info['reason'] = 'session_not_initialised'
+        else:
+            try:
+                user_resp = ms.api_call('user')
+                if isinstance(user_resp, dict) and not user_resp.get('error'):
+                    token_info['valid'] = True
+                    token_info['reason'] = 'ok'
+                    try:
+                        token_resp = ms.api_call('personal_access_tokens/self')
+                        if isinstance(token_resp, dict) and 'expires_at' in token_resp:
+                            token_info['expires_at'] = token_resp['expires_at']
+                    except Exception:
+                        pass
+                else:
+                    err_detail = user_resp.get('details', '') if isinstance(user_resp, dict) else ''
+                    if '401' in err_detail or 'Unauthorized' in err_detail:
+                        token_info['reason'] = 'invalid'
+                    elif '404' in err_detail or 'Not Found' in err_detail:
+                        token_info['reason'] = 'wrong_base_url'
+                    else:
+                        token_info['reason'] = 'invalid'
+            except Exception as _e:
+                _emsg = str(_e)
+                if 'NoneType' in _emsg or 'session' in _emsg.lower():
+                    token_info['reason'] = 'session_not_initialised'
+                else:
+                    token_info['reason'] = 'connection_error'
+
+        import concurrent.futures
+        def _fetch_project_path(pid_pname):
+            pid, pname = pid_pname
+            try:
+                proj_resp = ms.api_call(f"projects/{pid}")
+                if isinstance(proj_resp, dict) and not proj_resp.get('error'):
+                    path = proj_resp.get('path_with_namespace') or pname
+                else:
+                    path = pname
+            except Exception:
+                path = pname
+            return {'id': pid, 'name': pname, 'path_with_namespace': path}
+
+        projects_list = []
+        if PROJECT_NAMES:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(PROJECT_NAMES))) as ex:
+                projects_list = list(ex.map(_fetch_project_path, PROJECT_NAMES.items()))
+
+        print(f"[INFO] /api/config/reload: {len(PROJECT_NAMES)} projects, token_valid={token_info['valid']}")
+        return jsonify({
+            'success': True,
+            'projects': projects_list,
+            'base_url': ms.BASE_URL,
+            'assignees': ms.ASSIGNEE_USERNAMES,
+            'reviewers': ms.REVIEWER_USERNAMES,
+            'new_default_platform': ms.NEW_DEFAULT_PLATFORM,
+            'token_info': token_info
+        })
+    except Exception as e:
+        print(f"[ERROR] /api/config/reload error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/projects/<int:project_id>/cleanup', methods=['POST'])
+def cleanup_project(project_id):
+    try:
+        data = request.json or {}
+        branch_num = data.get('branch_num', '12938')
+        feature_branch = _build_feature_branch(branch_num, data.get("branch_prefix","task-"), data.get("branch_suffix","java17-migration"))
+        branch_result = ms.api_call(
+            f"projects/{project_id}/repository/branches/{urllib.parse.quote(feature_branch, safe='')}",
+            "DELETE"
+        )
+        branch_deleted = branch_result is None or (isinstance(branch_result, dict) and not branch_result.get('error'))
+        removed = pipeline_status.pop(str(project_id), None)
+        if removed is not None:
+            save_pipeline_state()
+        print(f"[CLEANUP] project {project_id}: branch_deleted={branch_deleted}, status_removed={removed is not None}")
+        return jsonify({'success': True, 'branch_deleted': branch_deleted, 'status_removed': removed is not None})
+    except Exception as e:
+        print(f"[ERROR] cleanup_project error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+def _resolve_health_url(base_url: str) -> str:
+    """
+    Normalise the configured actuator base URL into a /health URL.
+
+    Handles all three common ways people configure the URL:
+      http://host/actuator          → http://host/actuator/health   (append /health)
+      http://host                   → http://host/actuator/health   (append /actuator/health)
+      http://host/actuator/health   → http://host/actuator/health   (already correct, use as-is)
+    """
+    u = base_url.rstrip('/')
+    if u.endswith('/health'):
+        return u                          # already points at health endpoint
+    if u.endswith('/actuator'):
+        return u + '/health'             # base is actuator root
+    return u + '/actuator/health'        # bare host / context-path only
+
+
+def _call_health_url(url: str) -> dict:
+    """
+    Hit a Spring Boot /actuator/health URL and return a normalised dict.
+    On 404 tries the sibling path (/health ↔ /actuator/health) as fallback.
+    Returns: { status, detail, url, raw }
+    """
+    import requests as _req
+
+    def _try(u):
+        resp = _req.get(u, timeout=8, verify=ms.SSL_VERIFY)
+        return resp
+
+    tried = [url]
+    resp = _try(url)
+
+    # On 404: try the alternate path once
+    if resp.status_code == 404:
+        if '/actuator/health' in url:
+            alt = url.replace('/actuator/health', '/health')
+        elif url.endswith('/health'):
+            alt = url[:-len('/health')] + '/actuator/health'
+        else:
+            alt = None
+        if alt and alt not in tried:
+            tried.append(alt)
+            resp = _try(alt)
+
+    if resp.status_code == 404:
+        return {
+            'status': 'DOWN',
+            'detail': f'404 Not Found — tried: {", ".join(tried)}. Check your ACTUATOR URL in .env',
+            'url': tried[0], 'raw': {}
+        }
+
+    try:
+        data = resp.json() if resp.text else {}
+    except Exception:
+        data = {}
+
+    status = data.get('status', 'UNKNOWN').upper()
+    components = data.get('components', {})
+    detail_parts = [f"HTTP {resp.status_code}", f"status={status}"]
+    if components:
+        for comp, info in list(components.items())[:4]:
+            detail_parts.append(f"{comp}={info.get('status','?')}")
+
+    return {
+        'status': 'UP' if status == 'UP' else 'DOWN',
+        'detail': ' · '.join(detail_parts),
+        'url': resp.url, 'raw': data
+    }
+
+
+@app.route('/api/projects/<int:project_id>/health', methods=['GET'])
+def check_actuator_health(project_id):
+    """Check Spring Boot Actuator health. ?env=dev|test selects environment.
+    .env keys: ACTUATOR_<id>_DEV, ACTUATOR_<id>_TEST, ACTUATOR_<id> (plain fallback)
+    URL format: can be bare host, /actuator base, or /actuator/health — all handled.
+    """
+    import requests as _req
+    env = request.args.get('env', '').lower()
+    pid_str = str(project_id)
+    try:
+        urls_dev   = env_config.get('actuator_urls_dev',  {})
+        urls_test  = env_config.get('actuator_urls_test', {})
+        urls_plain = env_config.get('actuator_urls',      {})
+
+        if env == 'dev':
+            actuator_url = urls_dev.get(pid_str) or urls_plain.get(pid_str)
+            env_label, key_hint = 'DEV', f'ACTUATOR_{project_id}_DEV'
+        elif env == 'test':
+            actuator_url = urls_test.get(pid_str) or urls_plain.get(pid_str)
+            env_label, key_hint = 'TEST', f'ACTUATOR_{project_id}_TEST'
+        else:
+            actuator_url = urls_plain.get(pid_str) or urls_dev.get(pid_str) or urls_test.get(pid_str)
+            env_label, key_hint = '', f'ACTUATOR_{project_id}'
+
+        if not actuator_url:
+            return jsonify({'status': 'unconfigured', 'detail': f'No {key_hint} in .env', 'url': None, 'env': env_label})
+
+        health_url = _resolve_health_url(actuator_url)
+        try:
+            result = _call_health_url(health_url)
+            result['env'] = env_label
+            return jsonify(result)
+        except _req.exceptions.Timeout:
+            return jsonify({'status': 'DOWN', 'detail': f'Timeout: {health_url}', 'url': health_url, 'env': env_label})
+        except _req.exceptions.ConnectionError as ce:
+            return jsonify({'status': 'DOWN', 'detail': f'Connection refused: {health_url}', 'url': health_url, 'env': env_label})
+    except Exception as e:
+        return jsonify({'status': 'unknown', 'detail': str(e), 'url': None, 'env': ''}), 500
+
+
+@app.route('/api/projects/<int:project_id>/health/all', methods=['GET'])
+def check_actuator_health_all(project_id):
+    """Check DEV + TEST health simultaneously. Returns { dev: {...}, test: {...} }"""
+    import requests as _req
+    import concurrent.futures
+    pid_str = str(project_id)
+    urls_dev   = env_config.get('actuator_urls_dev',  {})
+    urls_test  = env_config.get('actuator_urls_test', {})
+    urls_plain = env_config.get('actuator_urls',      {})
+
+    def _check(url, label):
+        if not url:
+            return {'status': 'unconfigured', 'detail': f'No ACTUATOR_{project_id}_{label} in .env', 'env': label}
+        health_url = _resolve_health_url(url)
+        try:
+            result = _call_health_url(health_url)
+            result['env'] = label
+            return result
+        except _req.exceptions.Timeout:
+            return {'status': 'DOWN', 'detail': f'Timeout', 'env': label}
+        except Exception as ex:
+            return {'status': 'DOWN', 'detail': str(ex), 'env': label}
+
+    url_dev  = urls_dev.get(pid_str)  or urls_plain.get(pid_str)
+    url_test = urls_test.get(pid_str) or urls_plain.get(pid_str)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        fd = ex.submit(_check, url_dev,  'DEV')
+        ft = ex.submit(_check, url_test, 'TEST')
+    return jsonify({'dev': fd.result(), 'test': ft.result()})
+
+
+@app.route('/api/projects/<int:project_id>/branch-reset', methods=['POST'])
+def branch_reset(project_id):
+    """Delete the feature branch and recreate it fresh from develop/master/main.
+    This is a simpler alternative to file-by-file rollback.
+    Body: { branch_num, branch_prefix?, branch_suffix? }
+    """
+    try:
+        data = request.json or {}
+        branch_num    = data.get('branch_num', '12938')
+        branch_prefix = data.get('branch_prefix', 'task-')
+        branch_suffix = data.get('branch_suffix', 'java17-migration')
+        feature_branch = _build_feature_branch(branch_num, branch_prefix, branch_suffix)
+
+        source_branch = _resolve_source_branch(project_id)
+
+        print(f"[BRANCH-RESET] project {project_id}: deleting '{feature_branch}', will recreate from '{source_branch}'")
+
+        # Step 1: Delete the feature branch (ignore 404 — may not exist)
+        del_result = ms.api_call(
+            f"projects/{project_id}/repository/branches/{urllib.parse.quote(feature_branch, safe='')}",
+            "DELETE"
+        )
+        deleted_ok = del_result is None or (isinstance(del_result, dict) and not del_result.get('error'))
+        print(f"[BRANCH-RESET] delete result: {del_result}")
+
+        # Step 2: Recreate from source branch
+        create_result = ms.api_call(
+            f"projects/{project_id}/repository/branches",
+            "POST",
+            data={'branch': feature_branch, 'ref': source_branch}
+        )
+        if isinstance(create_result, dict) and create_result.get('error'):
+            return jsonify({
+                'success': False,
+                'error': f"Branch recreated failed: {create_result.get('details', 'unknown')}",
+                'branch': feature_branch,
+                'source': source_branch
+            }), 500
+
+        # Clear tracked pipeline status so the tool treats this as a fresh start
+        pipeline_status.pop(str(project_id), None)
+        save_pipeline_state()
+
+        add_project_to_history(project_id, f"project-{project_id}", 'branch_reset', 'success',
+                               f"Branch {feature_branch} deleted and recreated from {source_branch}")
+
+        return jsonify({
+            'success': True,
+            'branch': feature_branch,
+            'source': source_branch,
+            'detail': f"'{feature_branch}' deleted and recreated fresh from '{source_branch}'"
+        })
+    except Exception as e:
+        print(f"[ERROR] branch_reset error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/parent-pom-version', methods=['GET'])
+def get_parent_pom_version():
+    """Fetch the version of the custom parent pom from its own GitLab repository.
+    We read the project's OWN <version> tag (outside any <parent> block),
+    NOT the spring-boot-starter-parent version that lives inside <parent>.
+    Reads PARENT_POM_PROJECT_ID from .env config.
+    Returns: { version: str, source: 'repo'|'fallback', project_id: int, detail: str }
+    """
+    def _extract_project_version(pom_xml: str) -> str | None:
+        """
+        Return the project's own <version> — the one at the project level,
+        NOT the version nested inside a <parent>...</parent> block.
+        Strategy:
+          1. Strip all <parent>...</parent> blocks from the text.
+          2. Find the first remaining <version>...</version>.
+        """
+        # Remove parent block(s) so we don't accidentally read spring-boot version
+        stripped = re.sub(r'<parent>[\s\S]*?</parent>', '', pom_xml, flags=re.IGNORECASE)
+        m = re.search(r'<version>\s*(.*?)\s*</version>', stripped, re.IGNORECASE)
+        return m.group(1).strip() if m else None
+
+    try:
+        parent_pom_project_id = env_config.get('parent_pom_project_id')
+
+        if not parent_pom_project_id:
+            return jsonify({
+                'version': ms.TARGET_PARENT_VERSION,
+                'source': 'fallback',
+                'detail': 'No PARENT_POM_PROJECT_ID in .env — using hardcoded default 1.8.3',
+                'project_id': None
+            })
+
+        pom_content = None
+        used_ref = None
+        for ref in ('master', 'main', 'develop'):
+            pom_res = ms.api_call(
+                f"projects/{parent_pom_project_id}/repository/files/{urllib.parse.quote('pom.xml', safe='')}?ref={ref}"
+            )
+            if isinstance(pom_res, dict) and 'content' in pom_res:
+                pom_content = base64.b64decode(pom_res['content']).decode('utf-8', errors='replace')
+                used_ref = ref
+                break
+
+        if not pom_content:
+            return jsonify({
+                'version': ms.TARGET_PARENT_VERSION,
+                'source': 'fallback',
+                'detail': f'Could not fetch pom.xml from project {parent_pom_project_id} — check PARENT_POM_PROJECT_ID',
+                'project_id': parent_pom_project_id
+            })
+
+        version = _extract_project_version(pom_content)
+        if version:
+            ms.TARGET_PARENT_VERSION = version   # live-update so commits use fresh version
+            return jsonify({
+                'version': version,
+                'source': 'repo',
+                'detail': f'Project version from parent pom repo (id={parent_pom_project_id}, ref={used_ref})',
+                'project_id': parent_pom_project_id
+            })
+        else:
+            return jsonify({
+                'version': ms.TARGET_PARENT_VERSION,
+                'source': 'fallback',
+                'detail': f'No top-level <version> found in pom.xml (project {parent_pom_project_id})',
+                'project_id': parent_pom_project_id
+            })
+    except Exception as e:
+        return jsonify({'version': ms.TARGET_PARENT_VERSION, 'source': 'fallback', 'detail': str(e), 'project_id': None}), 500
+
+
+
 
 
 if __name__ == '__main__':
